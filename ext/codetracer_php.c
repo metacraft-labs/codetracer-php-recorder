@@ -24,6 +24,137 @@ static int tracing_enabled = 0;
 static int in_trace_hook = 0;  /* Prevent recursive tracing */
 static char *output_dir = NULL;
 
+/* Maximum length for serialized string values */
+#define MAX_VALUE_REPR_LEN 1024
+
+/* Serialize a zval into a trace variable record */
+static void serialize_zval(TraceWriterHandle *writer, const char *name, zval *val)
+{
+    if (!val || Z_TYPE_P(val) == IS_UNDEF) return;
+
+    switch (Z_TYPE_P(val)) {
+    case IS_NULL:
+        trace_writer_register_variable_raw(writer, name, "null", TK_RAW, "null");
+        break;
+    case IS_FALSE:
+        trace_writer_register_variable_raw(writer, name, "false", TK_BOOL, "boolean");
+        break;
+    case IS_TRUE:
+        trace_writer_register_variable_raw(writer, name, "true", TK_BOOL, "boolean");
+        break;
+    case IS_LONG:
+        trace_writer_register_variable_int(writer, name, Z_LVAL_P(val), TK_INT, "integer");
+        break;
+    case IS_DOUBLE: {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%g", Z_DVAL_P(val));
+        trace_writer_register_variable_raw(writer, name, buf, TK_FLOAT, "float");
+        break;
+    }
+    case IS_STRING: {
+        const char *str = Z_STRVAL_P(val);
+        size_t len = Z_STRLEN_P(val);
+        if (len <= MAX_VALUE_REPR_LEN) {
+            trace_writer_register_variable_raw(writer, name, str, TK_STRING, "string");
+        } else {
+            /* Truncate long strings */
+            char buf[MAX_VALUE_REPR_LEN + 4];
+            memcpy(buf, str, MAX_VALUE_REPR_LEN);
+            buf[MAX_VALUE_REPR_LEN] = '.';
+            buf[MAX_VALUE_REPR_LEN + 1] = '.';
+            buf[MAX_VALUE_REPR_LEN + 2] = '.';
+            buf[MAX_VALUE_REPR_LEN + 3] = '\0';
+            trace_writer_register_variable_raw(writer, name, buf, TK_STRING, "string");
+        }
+        break;
+    }
+    case IS_ARRAY: {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Array(%d)", zend_hash_num_elements(Z_ARRVAL_P(val)));
+        trace_writer_register_variable_raw(writer, name, buf, TK_SEQ, "array");
+        break;
+    }
+    case IS_OBJECT: {
+        zend_class_entry *ce = Z_OBJCE_P(val);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s {}", ZSTR_VAL(ce->name));
+        trace_writer_register_variable_raw(writer, name, buf, TK_STRUCT, ZSTR_VAL(ce->name));
+        break;
+    }
+    default: {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "<type:%d>", Z_TYPE_P(val));
+        trace_writer_register_variable_raw(writer, name, buf, TK_RAW, "unknown");
+        break;
+    }
+    }
+}
+
+/* Serialize a zval as a return value */
+static void serialize_return_zval(TraceWriterHandle *writer, zval *val)
+{
+    if (!val || Z_TYPE_P(val) == IS_UNDEF) {
+        trace_writer_register_return(writer);
+        return;
+    }
+
+    switch (Z_TYPE_P(val)) {
+    case IS_NULL:
+        trace_writer_register_return_raw(writer, "null", TK_RAW, "null");
+        break;
+    case IS_FALSE:
+        trace_writer_register_return_raw(writer, "false", TK_BOOL, "boolean");
+        break;
+    case IS_TRUE:
+        trace_writer_register_return_raw(writer, "true", TK_BOOL, "boolean");
+        break;
+    case IS_LONG:
+        trace_writer_register_return_int(writer, Z_LVAL_P(val), TK_INT, "integer");
+        break;
+    case IS_DOUBLE: {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%g", Z_DVAL_P(val));
+        trace_writer_register_return_raw(writer, buf, TK_FLOAT, "float");
+        break;
+    }
+    case IS_STRING: {
+        const char *str = Z_STRVAL_P(val);
+        size_t len = Z_STRLEN_P(val);
+        if (len <= MAX_VALUE_REPR_LEN) {
+            trace_writer_register_return_raw(writer, str, TK_STRING, "string");
+        } else {
+            char buf[MAX_VALUE_REPR_LEN + 4];
+            memcpy(buf, str, MAX_VALUE_REPR_LEN);
+            buf[MAX_VALUE_REPR_LEN] = '.';
+            buf[MAX_VALUE_REPR_LEN + 1] = '.';
+            buf[MAX_VALUE_REPR_LEN + 2] = '.';
+            buf[MAX_VALUE_REPR_LEN + 3] = '\0';
+            trace_writer_register_return_raw(writer, buf, TK_STRING, "string");
+        }
+        break;
+    }
+    case IS_ARRAY: {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Array(%d)", zend_hash_num_elements(Z_ARRVAL_P(val)));
+        trace_writer_register_return_raw(writer, buf, TK_SEQ, "array");
+        break;
+    }
+    case IS_OBJECT: {
+        zend_class_entry *ce = Z_OBJCE_P(val);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s {}", ZSTR_VAL(ce->name));
+        trace_writer_register_return_raw(writer, buf, TK_STRUCT, ZSTR_VAL(ce->name));
+        break;
+    }
+    default: {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "<type:%d>", Z_TYPE_P(val));
+        trace_writer_register_return_raw(writer, buf, TK_RAW, "unknown");
+        break;
+    }
+    }
+}
+
 /* Our execute_ex hook */
 static void codetracer_execute_ex(zend_execute_data *execute_data)
 {
@@ -51,13 +182,25 @@ static void codetracer_execute_ex(zend_execute_data *execute_data)
         }
     }
 
-    /* Register the call */
+    /* Register the call and capture arguments */
     if (func_name && file_name) {
         uintptr_t fid = trace_writer_ensure_function_id(
             trace_writer, func_name, file_name, (int64_t)line_no);
         trace_writer_register_call(trace_writer, fid);
         trace_writer_register_step(trace_writer, file_name, (int64_t)line_no);
         have_info = 1;
+
+        /* Capture function arguments */
+        if (func->type == ZEND_USER_FUNCTION) {
+            uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
+            zend_op_array *op_array = &func->op_array;
+
+            for (uint32_t i = 0; i < num_args && i < op_array->num_args; i++) {
+                zval *arg = ZEND_CALL_ARG(execute_data, i + 1);
+                const char *param_name = ZSTR_VAL(op_array->vars[i]);
+                serialize_zval(trace_writer, param_name, arg);
+            }
+        }
     }
 
     in_trace_hook = 0;
@@ -65,10 +208,16 @@ static void codetracer_execute_ex(zend_execute_data *execute_data)
     /* Call original handler (executes the actual PHP code) */
     original_zend_execute_ex(execute_data);
 
-    /* After return — use have_info since func_name may be invalidated */
+    /* After return — capture return value and register return */
     if (tracing_enabled && !in_trace_hook && trace_writer && have_info) {
         in_trace_hook = 1;
-        trace_writer_register_return(trace_writer);
+
+        if (execute_data->return_value) {
+            serialize_return_zval(trace_writer, execute_data->return_value);
+        } else {
+            trace_writer_register_return(trace_writer);
+        }
+
         in_trace_hook = 0;
     }
 }
@@ -146,6 +295,7 @@ PHP_RINIT_FUNCTION(codetracer)
     trace_writer_ensure_type_id(trace_writer, TK_BOOL, "boolean");
     trace_writer_ensure_type_id(trace_writer, TK_SEQ, "array");
     trace_writer_ensure_type_id(trace_writer, TK_RAW, "object");
+    trace_writer_ensure_type_id(trace_writer, TK_STRUCT, "class");
 
     /* Register start — must be called after TK_NONE is registered */
     if (script) {
