@@ -62,6 +62,14 @@ class CodeTracerSpan {
         return $this->url;
     }
 
+    /**
+     * Return elapsed time since span began, in milliseconds.
+     * Useful for the session manifest entry written by web_bootstrap.php.
+     */
+    public function getDurationMs(): int {
+        return (int)((hrtime(true) - $this->startTime) / 1_000_000);
+    }
+
     private function writeSpan(array $span): void {
         $line = json_encode($span, JSON_UNESCAPED_SLASHES) . "\n";
         @file_put_contents($this->manifestPath, $line, FILE_APPEND | LOCK_EX);

@@ -44,14 +44,24 @@ if ($__ct_enabled) {
         $statusCode = http_response_code() ?: 200;
         $__ct_span->end($statusCode);
 
-        // Write session manifest entry
+        // Write session manifest entry.
+        // The entry uses the span manifest format expected by `ct print`:
+        // a top-level "metadata" object with http.* fields, plus "status".
         $manifestPath = dirname($__ct_trace_dir) . '/session_manifest.jsonl';
+        $method = $_SERVER['REQUEST_METHOD'] ?? 'CLI';
+        $url = $_SERVER['REQUEST_URI'] ?? 'unknown';
+        $durationMs = $__ct_span->getDurationMs();
         $entry = json_encode([
             'trace_dir' => $__ct_trace_dir,
-            'method' => $_SERVER['REQUEST_METHOD'] ?? 'CLI',
-            'url' => $_SERVER['REQUEST_URI'] ?? 'unknown',
-            'status_code' => $statusCode,
+            'span_type' => 'web-request',
             'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
+            'status' => ($statusCode >= 400) ? 'error' : 'ok',
+            'metadata' => [
+                'http.method' => $method,
+                'http.url' => $url,
+                'http.status_code' => (string) $statusCode,
+                'http.duration_ms' => (string) $durationMs,
+            ],
         ], JSON_UNESCAPED_SLASHES) . "\n";
         @file_put_contents($manifestPath, $entry, FILE_APPEND | LOCK_EX);
     });

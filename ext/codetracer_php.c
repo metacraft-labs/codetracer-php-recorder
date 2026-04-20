@@ -242,21 +242,39 @@ PHP_MSHUTDOWN_FUNCTION(codetracer)
 /* Request initialization — create trace writer */
 PHP_RINIT_FUNCTION(codetracer)
 {
-    const char *out = getenv("CODETRACER_OUTPUT_DIR");
-    if (!out) out = "/tmp/codetracer_traces";
-
     const char *enabled_env = getenv("CODETRACER_ENABLED");
     if (!enabled_env || strcmp(enabled_env, "1") != 0) {
         tracing_enabled = 0;
         return SUCCESS;
     }
 
-    /* Create output directory for this request */
+    /*
+     * Determine the trace output directory.
+     *
+     * CODETRACER_TRACE_DIR takes priority -- it is set by web_bootstrap.php
+     * to a per-request directory so that the C extension writes its trace
+     * files (trace.bin, trace_metadata.json, trace_paths.json) into the
+     * same directory that the span manifest references via its "trace_dir"
+     * field.
+     *
+     * If CODETRACER_TRACE_DIR is not set (e.g. CLI or standalone mode),
+     * fall back to creating a timestamped subdirectory under
+     * CODETRACER_OUTPUT_DIR (or /tmp/codetracer_traces).
+     */
     char trace_dir[4096];
-    snprintf(trace_dir, sizeof(trace_dir), "%s/%ld_%d",
-            out, (long)time(NULL), (int)getpid());
-    mkdir(out, 0755);
-    mkdir(trace_dir, 0755);
+    const char *explicit_trace_dir = getenv("CODETRACER_TRACE_DIR");
+    if (explicit_trace_dir && explicit_trace_dir[0] != '\0') {
+        snprintf(trace_dir, sizeof(trace_dir), "%s", explicit_trace_dir);
+        /* The bootstrap already created this directory */
+        mkdir(trace_dir, 0755);
+    } else {
+        const char *out = getenv("CODETRACER_OUTPUT_DIR");
+        if (!out) out = "/tmp/codetracer_traces";
+        snprintf(trace_dir, sizeof(trace_dir), "%s/%ld_%d",
+                out, (long)time(NULL), (int)getpid());
+        mkdir(out, 0755);
+        mkdir(trace_dir, 0755);
+    }
 
     /* Create trace writer */
     const char *script = SG(request_info).path_translated;
