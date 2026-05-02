@@ -19,9 +19,11 @@
 
 /* Global state */
 static void (*original_zend_execute_ex)(zend_execute_data *execute_data);
+static size_t (*original_sapi_ub_write)(const char *str, size_t str_length) = NULL;
 static TraceWriterHandle *trace_writer = NULL;
 static int tracing_enabled = 0;
 static int in_trace_hook = 0;  /* Prevent recursive tracing */
+static int in_io_hook = 0;     /* Prevent recursive IO capture */
 static char *output_dir = NULL;
 
 /* Maximum length for serialized string values */
@@ -155,6 +157,50 @@ static void serialize_return_zval(TraceWriterHandle *writer, zval *val)
     }
 }
 
+/*
+ * Our SAPI unbuffered-write hook.
+ *
+ * PHP routes every stdout-bound write — `echo`, `print`, `var_dump`,
+ * `printf`, raw HTML body output — through `sapi_module.ub_write`.
+ * By interposing here, we capture all stdout chunks as Write events
+ * via `register_special_event(ELK_WRITE, ...)` without having to
+ * enumerate individual print-style functions.  This mirrors the
+ * canonical IO-capture pattern established for the Python recorder
+ * in handoff entry 1.27 (`register_special_event` with an
+ * EventLogKind matching the destination FD).
+ *
+ * Note: stderr writes (PHP `error_log`, `fwrite(STDERR, ...)`) and
+ * direct `fwrite` to file descriptors do NOT go through ub_write;
+ * dedicated capture hooks for those are tracked as a follow-up in
+ * AUDIT-CTFS-2026-05.md.
+ *
+ * The `in_io_hook` re-entry guard prevents accidental recursion if
+ * the trace writer (or downstream code) ever calls back into a
+ * print path.
+ */
+static size_t codetracer_sapi_ub_write(const char *str, size_t str_length)
+{
+    if (tracing_enabled && !in_io_hook && trace_writer && str && str_length > 0) {
+        in_io_hook = 1;
+        /* Copy to a NUL-terminated buffer because the FFI takes a
+         * C string.  `register_special_event` treats `content` as
+         * opaque text, so this preserves the bytes verbatim. */
+        char *buf = (char *)emalloc(str_length + 1);
+        if (buf) {
+            memcpy(buf, str, str_length);
+            buf[str_length] = '\0';
+            trace_writer_register_special_event(
+                trace_writer, ELK_WRITE, "stdout", buf);
+            efree(buf);
+        }
+        in_io_hook = 0;
+    }
+    if (original_sapi_ub_write) {
+        return original_sapi_ub_write(str, str_length);
+    }
+    return str_length;
+}
+
 /* Our execute_ex hook */
 static void codetracer_execute_ex(zend_execute_data *execute_data)
 {
@@ -182,15 +228,32 @@ static void codetracer_execute_ex(zend_execute_data *execute_data)
         }
     }
 
-    /* Register the call and capture arguments */
+    /* Register the call and capture arguments.
+     *
+     * IMPORTANT: per the canonical FFI contract (see
+     * trace_writer_register_call doc-comment in
+     * codetracer_trace_writer.h), the args are NOT passed as a
+     * parameter to register_call — they must be staged via
+     * register_variable_* (or, on Nim-backed writers,
+     * register_call_arg) BEFORE register_call so the call record
+     * decoder sees them at function-entry time.  This mirrors the
+     * canonical pattern fixed in the Ruby recorder (handoff entry
+     * 1.22 in /tmp/isonim-migration.txt) and the JS recorder
+     * (handoff entry 1.38).
+     *
+     * The current C FFI (codetracer_trace_writer_ffi) does not
+     * expose register_call_arg, so the args emitted here surface as
+     * scoped variables at the function-entry step rather than on
+     * CallRecord.args directly.  Populating CallRecord.args end-to-
+     * end requires extending the C FFI (see AUDIT-CTFS-2026-05.md).
+     */
     if (func_name && file_name) {
         uintptr_t fid = trace_writer_ensure_function_id(
             trace_writer, func_name, file_name, (int64_t)line_no);
-        trace_writer_register_call(trace_writer, fid);
-        trace_writer_register_step(trace_writer, file_name, (int64_t)line_no);
-        have_info = 1;
 
-        /* Capture function arguments */
+        /* Stage call arguments BEFORE register_call so they appear
+         * in the function-entry frame (canonical CTFS recorder
+         * pattern). */
         if (func->type == ZEND_USER_FUNCTION) {
             uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
             zend_op_array *op_array = &func->op_array;
@@ -201,6 +264,10 @@ static void codetracer_execute_ex(zend_execute_data *execute_data)
                 serialize_zval(trace_writer, param_name, arg);
             }
         }
+
+        trace_writer_register_call(trace_writer, fid);
+        trace_writer_register_step(trace_writer, file_name, (int64_t)line_no);
+        have_info = 1;
     }
 
     in_trace_hook = 0;
@@ -323,12 +390,31 @@ PHP_RINIT_FUNCTION(codetracer)
     tracing_enabled = 1;
     output_dir = strdup(trace_dir);
 
+    /* Install the SAPI unbuffered-write hook for stdout capture.
+     * We do this AFTER tracing_enabled = 1 so the very first event
+     * (e.g. an early `echo`) is captured.  The hook is restored in
+     * RSHUTDOWN so the next request starts from a clean slate.  The
+     * SAPI handler is per-process global state on most SAPIs (cli,
+     * cli-server, fpm, apache); restoring it makes us safe under
+     * non-tracing requests and under graceful module unload. */
+    if (!original_sapi_ub_write) {
+        original_sapi_ub_write = sapi_module.ub_write;
+        sapi_module.ub_write = codetracer_sapi_ub_write;
+    }
+
     return SUCCESS;
 }
 
 /* Request shutdown — finish trace */
 PHP_RSHUTDOWN_FUNCTION(codetracer)
 {
+    /* Restore the SAPI ub_write hook FIRST so any cleanup writes
+     * during writer teardown go to the original handler. */
+    if (original_sapi_ub_write) {
+        sapi_module.ub_write = original_sapi_ub_write;
+        original_sapi_ub_write = NULL;
+    }
+
     if (trace_writer) {
         trace_writer_finish_events(trace_writer);
         trace_writer_finish_metadata(trace_writer);
@@ -337,6 +423,8 @@ PHP_RSHUTDOWN_FUNCTION(codetracer)
         trace_writer = NULL;
     }
     tracing_enabled = 0;
+    in_io_hook = 0;
+    in_trace_hook = 0;
     if (output_dir) {
         free(output_dir);
         output_dir = NULL;
