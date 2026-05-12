@@ -399,6 +399,20 @@ PHP_RINIT_FUNCTION(codetracer)
     /* Register start — must be called after TK_NONE is registered */
     if (script) {
         trace_writer_start(trace_writer, script, 1);
+
+        /* Register a synthetic <toplevel> Function + Call so the script's
+         * top-level execution surfaces as a regular call frame.  Without
+         * this, ct-print only shows internal function calls and hides the
+         * outermost frame — every per-program test that asserts on call
+         * counts ends up off-by-one (see e2e flow_test: expects 2 funcs/
+         * calls/returns for {<toplevel>, compute}, was getting 1).
+         *
+         * The corresponding return-value Value record is emitted in
+         * RSHUTDOWN before trace_writer_close so call_exit carries the
+         * synthesised None payload. */
+        uintptr_t toplevel_fid = trace_writer_ensure_function_id(
+            trace_writer, "<toplevel>", script, 1);
+        trace_writer_register_call(trace_writer, toplevel_fid);
     }
 
     tracing_enabled = 1;
@@ -430,6 +444,10 @@ PHP_RSHUTDOWN_FUNCTION(codetracer)
     }
 
     if (trace_writer) {
+        /* Pair the synthetic <toplevel> Call registered in RINIT with a
+         * Return so call_exit ordering stays balanced. */
+        trace_writer_register_return(trace_writer);
+
         trace_writer_finish_events(trace_writer);
         trace_writer_finish_metadata(trace_writer);
         trace_writer_finish_paths(trace_writer);

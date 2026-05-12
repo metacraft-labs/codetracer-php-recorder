@@ -185,7 +185,12 @@ function ct_decode_events(string $traceDir): array {
     }
     $ctPath = $cts[0];
     $jsonOut = $traceDir . '/events.json';
-    $cmd = sprintf('%s --json-events %s > %s 2>&1',
+    // `--full` decodes call args, return values, and IO bytes —
+    // unlike `--json-events`, which emits a flat event stream
+    // without folding return values into the call records.  The
+    // policy mandates exact-decoded-value assertions, so we need
+    // `--full`.
+    $cmd = sprintf('%s --full %s > %s 2>&1',
         escapeshellarg($ct_print),
         escapeshellarg($ctPath),
         escapeshellarg($jsonOut));
@@ -193,70 +198,50 @@ function ct_decode_events(string $traceDir): array {
     if (!file_exists($jsonOut)) {
         throw new RuntimeException("ct-print failed");
     }
-    // ct-print's `data` field on Value events embeds raw CBOR bytes
-    // which can be invalid UTF-8; PHP's json_decode rejects those.
-    // Read the file as binary, replace invalid UTF-8 sequences before
-    // parsing.
     $raw = file_get_contents($jsonOut);
     $clean = mb_convert_encoding($raw, 'UTF-8', 'UTF-8');
-    $events = json_decode($clean, true, 512, JSON_THROW_ON_ERROR);
-    if (!is_array($events)) {
-        throw new RuntimeException("decoded event stream is not an array");
+    $doc = json_decode($clean, true, 512, JSON_THROW_ON_ERROR);
+    if (!is_array($doc) || !isset($doc['events'])) {
+        throw new RuntimeException("decoded document missing events[]");
     }
-    return ct_translate_to_legacy($events);
+    return ct_translate_to_legacy($doc);
 }
 
 /**
- * Map ct-print --json-events output into the legacy projection shape
+ * Map a ct-print --full document into the legacy projection shape
  * (`{Step:{...}}`, `{Call:{...}}`, `{Value:{...}}`, ...) so the
  * per-program assertions in this file don't need rewriting.
  *
- * Mapping:
- *   {type:"path",     ...} → {Path:        {id, path, name}}
- *   {type:"function", ...} → {Function:    {id, name}}
- *   {type:"varname",  ...} → {VariableName:{id, name}}
- *   {type:"type",     ...} → {Type:        {id, lang_type}}
- *   {type:"call",     ...} → {Call:        {function_id, function, depth, ...}}
- *                            and (if exit_step != entry_step) a
- *                            synthesized {Return: {function_id, function}}
- *                            inserted in step-order so projection
- *                            counts match the legacy schema.
- *   {type:"step",     ...} → {Step:        {path_id, line, function, depth}}
- *   {type:"value",    ...} → {Value:       {variable_id, value, varname}}
- *   {type:"io",       ...} → {Event:       {kind, content}}
+ * `--full` gives us:
+ *   * top-level paths[], functions[], varnames[], types[] arrays
+ *     (interning tables) — translated to the legacy declaration
+ *     events.
+ *   * events[] with `kind` discriminator: call_entry, call_exit,
+ *     step, value, io.  call_exit carries the decoded
+ *     return_value, so we map it to the legacy Return event.
+ *
+ * The synthetic `<toplevel>` frame (depth==0, name=="<toplevel>")
+ * gets a Call but no Return, mirroring the legacy convention that
+ * the outermost frame never emitted a standalone Return event.
  */
-function ct_translate_to_legacy(array $events): array {
+function ct_translate_to_legacy(array $doc): array {
     $out = [];
-    // Pass 1: emit declarations, steps, values, io.  Track call
-    // records keyed by exit_step so we can interleave Return events.
-    $returnsAtStep = []; // step_index → array of Return records
-    foreach ($events as $e) {
-        $t = $e['type'] ?? null;
-        switch ($t) {
-            case 'path':
-                // Legacy projection used the path string as the Path
-                // event's payload (so $proj['Path'][0] is a string).
-                $out[] = ['Path' => $e['name']];
-                break;
-            case 'function':
-                $out[] = ['Function' => [
-                    'id' => $e['function_id'],
-                    'name' => $e['name'],
-                ]];
-                break;
-            case 'varname':
-                $out[] = ['VariableName' => [
-                    'id' => $e['varname_id'],
-                    'name' => $e['name'],
-                ]];
-                break;
-            case 'type':
-                $out[] = ['Type' => [
-                    'id' => $e['type_id'],
-                    'lang_type' => $e['name'],
-                ]];
-                break;
-            case 'call':
+    foreach (($doc['paths'] ?? []) as $i => $name) {
+        $out[] = ['Path' => $name];
+    }
+    foreach (($doc['functions'] ?? []) as $i => $name) {
+        $out[] = ['Function' => ['id' => $i, 'name' => $name]];
+    }
+    foreach (($doc['varnames'] ?? []) as $i => $name) {
+        $out[] = ['VariableName' => ['id' => $i, 'name' => $name]];
+    }
+    foreach (($doc['types'] ?? []) as $i => $name) {
+        $out[] = ['Type' => ['id' => $i, 'lang_type' => $name]];
+    }
+    foreach (($doc['events'] ?? []) as $e) {
+        $k = $e['kind'] ?? null;
+        switch ($k) {
+            case 'call_entry':
                 $out[] = ['Call' => [
                     'function_id' => $e['function_id'],
                     'function' => $e['function'] ?? null,
@@ -264,59 +249,60 @@ function ct_translate_to_legacy(array $events): array {
                     'entry_step' => $e['entry_step'] ?? 0,
                     'exit_step' => $e['exit_step'] ?? 0,
                 ]];
-                // ct-print embeds the call's return as exit_step.  In
-                // the legacy schema every Call had a paired Return
-                // unless the function never returned (top-level).  We
-                // synthesise a Return when exit_step > entry_step,
-                // parked to be inserted after the corresponding step.
-                if (($e['exit_step'] ?? 0) > ($e['entry_step'] ?? 0)) {
-                    $idx = $e['exit_step'];
-                    if (!isset($returnsAtStep[$idx])) $returnsAtStep[$idx] = [];
-                    $returnsAtStep[$idx][] = ['Return' => [
+                break;
+            case 'call_exit':
+                // Synthetic <toplevel> never emits a Return event —
+                // matches the legacy projection convention.
+                $isToplevel = ($e['depth'] ?? 0) === 0
+                    && (($e['function'] ?? '') === '<toplevel>');
+                if (!$isToplevel) {
+                    // ct-print --full emits {kind:"Void"} for
+                    // implicit-return frames (constructors, throw-
+                    // exit paths, register_return-with-no-value).
+                    // The legacy projection used {kind:"None"} for
+                    // both — map Void → None to keep parity.
+                    $rv = $e['return_value'] ?? ['kind' => 'None'];
+                    if (($rv['kind'] ?? '') === 'Void') {
+                        $rv = ['kind' => 'None'];
+                    }
+                    $out[] = ['Return' => [
                         'function_id' => $e['function_id'],
                         'function' => $e['function'] ?? null,
+                        'return_value' => $rv,
                     ]];
                 }
                 break;
             case 'step':
                 $out[] = ['Step' => [
-                    'path_id' => $e['path_id'],
-                    'line' => $e['line'],
+                    'path_id' => $e['path_id'] ?? null,
+                    'line' => $e['line'] ?? null,
                     'function_id' => $e['function_id'] ?? null,
                     'function' => $e['function'] ?? null,
                     'depth' => $e['depth'] ?? 0,
                     'step_index' => $e['step_index'] ?? null,
                 ]];
-                // Drain any Returns whose exit_step equals this step.
-                $idx = $e['step_index'] ?? -1;
-                if (isset($returnsAtStep[$idx])) {
-                    foreach ($returnsAtStep[$idx] as $r) $out[] = $r;
-                    unset($returnsAtStep[$idx]);
-                }
                 break;
             case 'value':
                 $out[] = ['Value' => [
-                    'variable_id' => $e['varname_id'],
+                    'variable_id' => $e['varname_id'] ?? null,
                     'varname' => $e['varname'] ?? null,
                     'value' => $e['value'] ?? null,
                     'type_id' => $e['type_id'] ?? null,
                 ]];
                 break;
             case 'io':
-                // Map ioStdout→Write, ioStderr→WriteOther for parity with
-                // the legacy `Event` records' `kind` field.
-                $kind = ($e['kind'] ?? '') === 'ioStdout' ? 'Write' : 'WriteOther';
+                // Legacy `Event.kind` was a numeric EventLogKind
+                // discriminant: 0=Write (stdout), 1=WriteOther
+                // (stderr).  `metadata` carried the stream name
+                // ("stdout"/"stderr").
+                $isStdout = ($e['io_kind'] ?? '') === 'ioStdout';
                 $out[] = ['Event' => [
-                    'kind' => $kind,
-                    'content' => $e['data'] ?? '',
+                    'kind' => $isStdout ? 0 : 1,
+                    'metadata' => $isStdout ? 'stdout' : 'stderr',
+                    'content' => $e['text'] ?? '',
                 ]];
                 break;
         }
-    }
-    // Drain any Returns whose target step never appeared (shouldn't
-    // happen, but keep them so projection counts stay consistent).
-    foreach ($returnsAtStep as $idx => $rs) {
-        foreach ($rs as $r) $out[] = $r;
     }
     return $out;
 }
