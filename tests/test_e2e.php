@@ -6,35 +6,23 @@
  *
  *   1. Records the program through the recorder's normal entry point
  *      (`php -d extension=ext/modules/codetracer.so program.php`).
- *   2. Decodes the produced trace.bin into a JSON event stream.
+ *   2. Decodes the produced `<program>.ct` CTFS bundle into a JSON
+ *      event stream via `ct-print --json-events`.
  *   3. Asserts on the **exact event counts**, **exact event order**,
  *      **exact decoded values**, and **exact ValueRecord variant
  *      tags** — per `metacraft-specs/policies/recorder-test-
  *      requirements.md` §1 ("Maximum assertion strength").
  *
- * Decoder note (see RECORDER BUG block below): the spec calls for
- * piping the produced `.ct` bundle through `ct-print --full
- * --strip-paths`, but the PHP recorder writes the *legacy* CBOR+Zstd
- * v1 binary container (FMT_BINARY) rather than a CTFS multi-stream
- * `.ct` bundle.  The version byte (0x01) trips ct-print's CTFS
- * reader (which accepts v2/v3/v4 only — see
- * `codetracer-trace-format-nim/src/codetracer_ctfs/container.nim`,
- * `hasValidVersion`).  The root cause is documented in
- * `AUDIT-CTFS-2026-05.md` (open gap "f") and tracked in
- * handoff entry 1.41 / section 5.6: the C FFI
- * (`codetracer_trace_writer_ffi`) does not yet expose `FMT_CTFS`.
- *
- * Workaround used here: shell out to `codetracer_trace_util convert
- * <trace.bin> <out.json>`, which is the canonical decoder for the
- * legacy CBOR+Zstd format that the FFI currently emits.  The
- * resulting JSON event stream uses the wrapped legacy schema
- * (`{"Step":{...}}`, `{"Call":{...}}`, `{"Value":{...}}`, ...) —
- * the same one the Ruby recorder's pure-recorder path emits.  When
- * the FFI grows `FMT_CTFS` and the PHP extension is switched to
- * pass it, we will replace the `convert` shell-out with a direct
- * `ct-print --full --strip-paths` invocation and migrate the
- * assertions to the normalised CTFS schema (`functions[]`, `paths[]`,
- * `events[]` with `kind: step|call_entry|call_exit|...`).
+ * Decoder note: the recorder now writes a CTFS V4 multi-stream `.ct`
+ * bundle (via the Nim FFI in `codetracer-trace-format-nim`).  The
+ * `ct-print --json-events` schema uses lowercase `type` discriminators
+ * (`{type:"step", ...}`, `{type:"call", ...}`, ...) and folds Returns
+ * into call records' `exit_step`, so this file translates the new
+ * shape back into the legacy projection-friendly form
+ * (`{Step:{...}}`, `{Call:{...}}`, `{Return:{...}}`, ...) — see
+ * `ct_translate_to_legacy()`.  Test bodies still assert on the legacy
+ * shape; when they migrate to the native CTFS shape the translator
+ * can be removed.
  *
  * No test in this file is a no-op or substring-only check.  When the
  * recorder is missing a feature the test EITHER asserts on the
@@ -104,20 +92,19 @@ function ct_extension_path(): string {
     return ct_repo_root() . '/ext/modules/codetracer.so';
 }
 
-function ct_trace_format_dir(): string {
-    $env = getenv('TRACE_FORMAT_DIR');
+function ct_trace_format_nim_dir(): string {
+    $env = getenv('TRACE_FORMAT_NIM_DIR');
     if ($env !== false && $env !== '') return $env;
-    // Default per scripts/run_with_tracing.sh and the flake's shellHook.
-    return ct_repo_root() . '/../codetracer-trace-format';
+    return ct_repo_root() . '/../codetracer-trace-format-nim';
 }
 
-function ct_trace_util_path(): string {
-    return ct_trace_format_dir() . '/target/release/codetracer_trace_util';
+function ct_print_path(): string {
+    return ct_trace_format_nim_dir() . '/ct-print';
 }
 
 function ct_ld_library_path(): string {
     $cur = getenv('LD_LIBRARY_PATH');
-    $libdir = ct_trace_format_dir() . '/target/release';
+    $libdir = ct_trace_format_nim_dir();
     return $libdir . ($cur ? ':' . $cur : '');
 }
 
@@ -172,36 +159,166 @@ function ct_record(string $programPath): array {
 }
 
 /**
- * Decode the recorder's trace.bin into the legacy-schema JSON event
- * array via `codetracer_trace_util convert`.  Returns the parsed
- * event array.  Throws on missing decoder / decode failure.
+ * Decode the recorder's `.ct` CTFS container into the legacy-schema
+ * JSON event array via `ct-print --json-events`, then translate the
+ * new-format events into the projection-friendly legacy shape this
+ * suite already asserts on (`{Step:{...}}`, `{Call:{...}}`, ...).
+ *
+ * The new ct-print format uses `{type: "step", ...}` (lowercase),
+ * doesn't emit standalone `Return` events (call records carry
+ * `exit_step`), and renames a few fields.  The translator below maps
+ * back to the legacy projection shape so the per-program test bodies
+ * don't need to be rewritten — see ct_translate_to_legacy() for the
+ * exact mapping.  When the test bodies migrate to the new schema,
+ * this translator can be removed.
  */
 function ct_decode_events(string $traceDir): array {
-    $util = ct_trace_util_path();
-    if (!is_executable($util)) {
+    $ct_print = ct_print_path();
+    if (!is_executable($ct_print)) {
         throw new RuntimeException(
-            "codetracer_trace_util binary not found or not executable at $util " .
-            "(rebuild the codetracer-trace-format sibling with `cargo build --release`)");
+            "ct-print binary not found or not executable at $ct_print " .
+            "(build it with `cd " . ct_trace_format_nim_dir() . " && nimble buildCtPrint`)");
     }
-    $bin = $traceDir . '/trace.bin';
-    if (!file_exists($bin)) {
-        throw new RuntimeException("trace.bin missing in $traceDir");
+    $cts = glob($traceDir . '/*.ct');
+    if (!$cts) {
+        throw new RuntimeException(".ct file missing in $traceDir");
     }
-    $jsonOut = $traceDir . '/trace.json';
-    $cmd = sprintf('%s convert %s %s 2>&1',
-        escapeshellarg($util),
-        escapeshellarg($bin),
+    $ctPath = $cts[0];
+    $jsonOut = $traceDir . '/events.json';
+    $cmd = sprintf('%s --json-events %s > %s 2>&1',
+        escapeshellarg($ct_print),
+        escapeshellarg($ctPath),
         escapeshellarg($jsonOut));
-    $out = shell_exec($cmd);
+    shell_exec($cmd);
     if (!file_exists($jsonOut)) {
-        throw new RuntimeException("convert failed: $out");
+        throw new RuntimeException("ct-print failed");
     }
+    // ct-print's `data` field on Value events embeds raw CBOR bytes
+    // which can be invalid UTF-8; PHP's json_decode rejects those.
+    // Read the file as binary, replace invalid UTF-8 sequences before
+    // parsing.
     $raw = file_get_contents($jsonOut);
-    $events = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
+    $clean = mb_convert_encoding($raw, 'UTF-8', 'UTF-8');
+    $events = json_decode($clean, true, 512, JSON_THROW_ON_ERROR);
     if (!is_array($events)) {
         throw new RuntimeException("decoded event stream is not an array");
     }
-    return $events;
+    return ct_translate_to_legacy($events);
+}
+
+/**
+ * Map ct-print --json-events output into the legacy projection shape
+ * (`{Step:{...}}`, `{Call:{...}}`, `{Value:{...}}`, ...) so the
+ * per-program assertions in this file don't need rewriting.
+ *
+ * Mapping:
+ *   {type:"path",     ...} → {Path:        {id, path, name}}
+ *   {type:"function", ...} → {Function:    {id, name}}
+ *   {type:"varname",  ...} → {VariableName:{id, name}}
+ *   {type:"type",     ...} → {Type:        {id, lang_type}}
+ *   {type:"call",     ...} → {Call:        {function_id, function, depth, ...}}
+ *                            and (if exit_step != entry_step) a
+ *                            synthesized {Return: {function_id, function}}
+ *                            inserted in step-order so projection
+ *                            counts match the legacy schema.
+ *   {type:"step",     ...} → {Step:        {path_id, line, function, depth}}
+ *   {type:"value",    ...} → {Value:       {variable_id, value, varname}}
+ *   {type:"io",       ...} → {Event:       {kind, content}}
+ */
+function ct_translate_to_legacy(array $events): array {
+    $out = [];
+    // Pass 1: emit declarations, steps, values, io.  Track call
+    // records keyed by exit_step so we can interleave Return events.
+    $returnsAtStep = []; // step_index → array of Return records
+    foreach ($events as $e) {
+        $t = $e['type'] ?? null;
+        switch ($t) {
+            case 'path':
+                // Legacy projection used the path string as the Path
+                // event's payload (so $proj['Path'][0] is a string).
+                $out[] = ['Path' => $e['name']];
+                break;
+            case 'function':
+                $out[] = ['Function' => [
+                    'id' => $e['function_id'],
+                    'name' => $e['name'],
+                ]];
+                break;
+            case 'varname':
+                $out[] = ['VariableName' => [
+                    'id' => $e['varname_id'],
+                    'name' => $e['name'],
+                ]];
+                break;
+            case 'type':
+                $out[] = ['Type' => [
+                    'id' => $e['type_id'],
+                    'lang_type' => $e['name'],
+                ]];
+                break;
+            case 'call':
+                $out[] = ['Call' => [
+                    'function_id' => $e['function_id'],
+                    'function' => $e['function'] ?? null,
+                    'depth' => $e['depth'] ?? 0,
+                    'entry_step' => $e['entry_step'] ?? 0,
+                    'exit_step' => $e['exit_step'] ?? 0,
+                ]];
+                // ct-print embeds the call's return as exit_step.  In
+                // the legacy schema every Call had a paired Return
+                // unless the function never returned (top-level).  We
+                // synthesise a Return when exit_step > entry_step,
+                // parked to be inserted after the corresponding step.
+                if (($e['exit_step'] ?? 0) > ($e['entry_step'] ?? 0)) {
+                    $idx = $e['exit_step'];
+                    if (!isset($returnsAtStep[$idx])) $returnsAtStep[$idx] = [];
+                    $returnsAtStep[$idx][] = ['Return' => [
+                        'function_id' => $e['function_id'],
+                        'function' => $e['function'] ?? null,
+                    ]];
+                }
+                break;
+            case 'step':
+                $out[] = ['Step' => [
+                    'path_id' => $e['path_id'],
+                    'line' => $e['line'],
+                    'function_id' => $e['function_id'] ?? null,
+                    'function' => $e['function'] ?? null,
+                    'depth' => $e['depth'] ?? 0,
+                    'step_index' => $e['step_index'] ?? null,
+                ]];
+                // Drain any Returns whose exit_step equals this step.
+                $idx = $e['step_index'] ?? -1;
+                if (isset($returnsAtStep[$idx])) {
+                    foreach ($returnsAtStep[$idx] as $r) $out[] = $r;
+                    unset($returnsAtStep[$idx]);
+                }
+                break;
+            case 'value':
+                $out[] = ['Value' => [
+                    'variable_id' => $e['varname_id'],
+                    'varname' => $e['varname'] ?? null,
+                    'value' => $e['value'] ?? null,
+                    'type_id' => $e['type_id'] ?? null,
+                ]];
+                break;
+            case 'io':
+                // Map ioStdout→Write, ioStderr→WriteOther for parity with
+                // the legacy `Event` records' `kind` field.
+                $kind = ($e['kind'] ?? '') === 'ioStdout' ? 'Write' : 'WriteOther';
+                $out[] = ['Event' => [
+                    'kind' => $kind,
+                    'content' => $e['data'] ?? '',
+                ]];
+                break;
+        }
+    }
+    // Drain any Returns whose target step never appeared (shouldn't
+    // happen, but keep them so projection counts stay consistent).
+    foreach ($returnsAtStep as $idx => $rs) {
+        foreach ($rs as $r) $out[] = $r;
+    }
+    return $out;
 }
 
 /**
@@ -274,15 +391,15 @@ if (!file_exists(ct_extension_path())) {
 }
 ct_pass("extension binary exists");
 
-if (!is_executable(ct_trace_util_path())) {
+if (!is_executable(ct_print_path())) {
     // Hard fail rather than skip.  The decoder is required for the
     // policy-mandated EXACT-event-content assertions; without it the
     // suite degrades to substring-only checks (forbidden by §1).
-    echo "  FAIL: codetracer_trace_util not built at " . ct_trace_util_path() . "\n";
-    echo "        Build it with: cd " . ct_trace_format_dir() . " && cargo build --release\n";
+    echo "  FAIL: ct-print not built at " . ct_print_path() . "\n";
+    echo "        Build it with: cd " . ct_trace_format_nim_dir() . " && nimble buildCtPrint\n";
     exit(1);
 }
-ct_pass("codetracer_trace_util decoder exists");
+ct_pass("ct-print CTFS decoder exists");
 
 // ---------------------------------------------------------------------------
 // Per-program tests
@@ -634,8 +751,9 @@ $combined = $so2 . $se2;
 ct_assert_true(str_contains($combined, 'unhandled'),
     'exceptions: --terminate output contains the unhandled exception message',
     'combined output was: ' . $combined);
-ct_assert_true(file_exists($traceDir2 . '/trace.bin'),
-    'exceptions: --terminate still produced trace.bin (recorder runs to RSHUTDOWN)');
+$cts2 = glob($traceDir2 . '/*.ct');
+ct_assert_true(!empty($cts2),
+    'exceptions: --terminate still produced a .ct CTFS bundle (recorder runs to RSHUTDOWN)');
 
 // =========================================================================
 // closures.php — Closure::bind, arrow functions, value vs ref captures.

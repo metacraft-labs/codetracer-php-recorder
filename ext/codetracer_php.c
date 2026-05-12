@@ -347,7 +347,21 @@ PHP_RINIT_FUNCTION(codetracer)
     const char *script = SG(request_info).path_translated;
     if (!script) script = "php";
 
-    trace_writer = trace_writer_new(script, FMT_BINARY);
+    /* CTFS V4 multi-stream is the canonical CodeTracer trace format
+     * — see `metacraft-specs/policies/recorder-test-requirements.md`
+     * §1 and `Recorder-CLI-Conventions.md` §4.  We pass `FMT_CTFS`
+     * (alias for the Nim FFI's `FFI_TRACE_FORMAT_BINARY`, value 2):
+     * the Nim writer interprets that as multi-stream V4 (steps.dat /
+     * calls.dat / values.dat / paths.dat / meta.dat / etc.), which is
+     * the layout `ct print --full` decodes directly.
+     *
+     * Pre-2026-05 the PHP recorder linked against the Rust FFI from
+     * `codetracer-trace-format`, where format=2 meant the legacy
+     * CBOR+Zstd writer that ct-print couldn't decode at all.
+     * `ext/build.sh` now links against the Nim FFI from
+     * `codetracer-trace-format-nim`, where the same value activates
+     * the multi-stream path. */
+    trace_writer = trace_writer_new(script, FMT_CTFS);
     if (!trace_writer) {
         return SUCCESS;
     }
@@ -419,6 +433,13 @@ PHP_RSHUTDOWN_FUNCTION(codetracer)
         trace_writer_finish_events(trace_writer);
         trace_writer_finish_metadata(trace_writer);
         trace_writer_finish_paths(trace_writer);
+        /* trace_writer_close flushes the in-memory CTFS container and
+         * actually writes the .ct file to disk.  In the Nim FFI this is
+         * NOT done by trace_writer_free — the close + free split mirrors
+         * the rust FFI's contract (and matches tests/test_ffi.c in the
+         * Nim repo).  Without this call the trace dir stays empty even
+         * though every other FFI call returns success. */
+        trace_writer_close(trace_writer);
         trace_writer_free(trace_writer);
         trace_writer = NULL;
     }

@@ -24,16 +24,16 @@ build-ext: build
 #      canonical CTFS format).
 #
 # `LD_LIBRARY_PATH` is required so that the recorder's C extension
-# can locate `libcodetracer_trace_writer_ffi.so` produced by the
-# sibling `codetracer-trace-format` checkout.  The flake's shellHook
-# sets `TRACE_FORMAT_DIR` to that sibling, so we resolve the lib dir
-# from it rather than the legacy `../../` path.
+# can locate `libcodetracer_trace_writer.so` produced by the
+# sibling `codetracer-trace-format-nim` checkout.  The flake's shellHook
+# sets `TRACE_FORMAT_NIM_DIR` to that sibling, so we resolve the lib
+# dir from it rather than the legacy `../../` path.
 test: build
     php tests/test_span.php
     CODETRACER_ENABLED=1 CODETRACER_OUTPUT_DIR=/tmp/codetracer_test_traces \
-    LD_LIBRARY_PATH="${TRACE_FORMAT_DIR}/target/release:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
     php -d extension=ext/modules/codetracer.so tests/test_extension.php
-    LD_LIBRARY_PATH="${TRACE_FORMAT_DIR}/target/release:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
     php tests/test_e2e.php
 
 t: test
@@ -42,12 +42,12 @@ t: test
 # Useful when iterating on the C extension itself.
 test-ext: build
     CODETRACER_ENABLED=1 CODETRACER_OUTPUT_DIR=/tmp/codetracer_test_traces \
-    LD_LIBRARY_PATH="${TRACE_FORMAT_DIR}/target/release:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
     php -d extension=ext/modules/codetracer.so tests/test_extension.php
 
 # End-to-end per-program suite only (requires `just build` first).
 test-e2e: build
-    LD_LIBRARY_PATH="${TRACE_FORMAT_DIR}/target/release:${LD_LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
     php tests/test_e2e.php
 
 # Run integration test

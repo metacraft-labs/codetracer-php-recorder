@@ -5,13 +5,16 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     pre-commit-hooks.url = "github:cachix/git-hooks.nix";
 
-    # Sibling repo source — the PHP extension links against the Rust trace
-    # writer FFI shared library produced from codetracer-trace-format. We
-    # don't fetch the binary here (the dev shell builds it from the sibling
-    # checkout); this input only exists so `nix flake check` can resolve
-    # the source for derivations that need it.
-    codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/main";
+    # Sibling repo source — the PHP extension links against the Nim trace
+    # writer FFI shared library produced from codetracer-trace-format-nim
+    # (NOT the Rust FFI in codetracer-trace-format). Only the Nim writer
+    # produces the canonical V4 multi-stream CTFS layout that ct-print can
+    # decode — see ext/build.sh for the rationale. We don't fetch the binary
+    # here (the dev shell builds it from the sibling checkout); this input
+    # only exists so `nix flake check` can resolve the source for
+    # derivations that need it.
+    codetracer-trace-format-nim = {
+      url = "github:metacraft-labs/codetracer-trace-format-nim/main";
       flake = false;
     };
   };
@@ -21,7 +24,7 @@
       self,
       nixpkgs,
       pre-commit-hooks,
-      codetracer-trace-format,
+      codetracer-trace-format-nim,
     }:
     let
       systems = [
@@ -76,13 +79,12 @@
               phpWithDev
               phpWithDev.unwrapped.dev
 
-              # Rust toolchain — only needed if rebuilding the trace writer
+              # Nim toolchain — only needed if rebuilding the trace writer
               # FFI from source.  Most contributors will pull the prebuilt
-              # libcodetracer_trace_writer_ffi.so from the sibling checkout.
-              cargo
-              rustc
-              rustfmt
-              clippy
+              # libcodetracer_trace_writer.so from the sibling checkout
+              # (built via `nim c --app:lib ...` from
+              # codetracer-trace-format-nim).
+              nim
 
               # Build automation
               just
@@ -92,19 +94,19 @@
               libtool
               pkg-config
 
-              # Trace format dependencies — zstd is needed by the Rust FFI
-              # crate at link time.
+              # Trace format dependencies — zstd is needed by the Nim FFI
+              # at link time (CTFS uses seekable-zstd compression).
               zstd
             ];
 
             # The PHP extension's build.sh expects to find the prebuilt
-            # FFI library in a sibling checkout of codetracer-trace-format.
-            # Override with TRACE_FORMAT_DIR when working off a different
+            # FFI library in a sibling checkout of codetracer-trace-format-nim.
+            # Override with TRACE_FORMAT_NIM_DIR when working off a different
             # path.
             shellHook = ''
               ${preCommit.shellHook}
-              if [ -z "''${TRACE_FORMAT_DIR:-}" ] && [ -d "$PWD/../codetracer-trace-format" ]; then
-                export TRACE_FORMAT_DIR="$PWD/../codetracer-trace-format"
+              if [ -z "''${TRACE_FORMAT_NIM_DIR:-}" ] && [ -d "$PWD/../codetracer-trace-format-nim" ]; then
+                export TRACE_FORMAT_NIM_DIR="$PWD/../codetracer-trace-format-nim"
               fi
             '';
           };
