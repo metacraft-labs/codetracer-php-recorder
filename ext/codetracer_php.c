@@ -366,17 +366,14 @@ PHP_RINIT_FUNCTION(codetracer)
         return SUCCESS;
     }
 
-    /* Begin writing trace files */
+    /* Begin writing the events stream.  The Nim multi-stream writer
+     * derives the `.ct` container path from the events path; metadata
+     * and paths streams are written into the container on close, so the
+     * legacy `trace_metadata.json` / `trace_paths.json` sidecars are no
+     * longer produced. */
     char path_buf[4096];
-
-    snprintf(path_buf, sizeof(path_buf), "%s/trace_metadata.json", trace_dir);
-    trace_writer_begin_metadata(trace_writer, path_buf);
-
     snprintf(path_buf, sizeof(path_buf), "%s/trace.bin", trace_dir);
     trace_writer_begin_events(trace_writer, path_buf);
-
-    snprintf(path_buf, sizeof(path_buf), "%s/trace_paths.json", trace_dir);
-    trace_writer_begin_paths(trace_writer, path_buf);
 
     /* Set working directory */
     char cwd[4096];
@@ -449,8 +446,14 @@ PHP_RSHUTDOWN_FUNCTION(codetracer)
         trace_writer_register_return(trace_writer);
 
         trace_writer_finish_events(trace_writer);
-        trace_writer_finish_metadata(trace_writer);
-        trace_writer_finish_paths(trace_writer);
+        /* Write the branded recorder-id field into `meta.dat` (CTFS
+         * spec §7) before closing the writer. */
+        {
+            const char recorder_id[] = "codetracer-php-recorder";
+            ct_write_meta_dat(trace_writer,
+                              (const uint8_t *)recorder_id,
+                              sizeof(recorder_id) - 1);
+        }
         /* trace_writer_close flushes the in-memory CTFS container and
          * actually writes the .ct file to disk.  In the Nim FFI this is
          * NOT done by trace_writer_free — the close + free split mirrors
