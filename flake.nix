@@ -2,7 +2,7 @@
   description = "Development environment for codetracer-php-recorder";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     pre-commit-hooks.url = "github:cachix/git-hooks.nix";
 
     # Sibling repo source — the PHP extension links against the Nim trace
@@ -88,6 +88,7 @@
 
               # Build automation
               just
+              prek
               gnumake
               autoconf
               automake
