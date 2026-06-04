@@ -1,0 +1,90 @@
+name: launcher-integration
+
+# Single-edge cross-repo CI: when codetracer-php-recorder changes,
+# verify the launcher's bundled-composer build still works against
+# this recorder's source. Mirrors the pattern in
+# codetracer-specs/Testing/Cross-Repo-CI-Integration.md.
+#
+# Added as part of the M9 extension that brought PHP / Composer /
+# Packagist into the campaign's package-manager matrix alongside the
+# original Python, Ruby, JavaScript trio.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  composer-bundling:
+    runs-on: ubuntu-latest
+    name: composer bundling smoke-test
+    steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - uses: actions/checkout@v4
+        with:
+          path: codetracer-php-recorder
+
+      - uses: metacraft-labs/metacraft-github-actions/clone-repo@main
+        with:
+          repo: metacraft-labs/codetracer-launcher
+          ref: main
+          path: codetracer-launcher
+          gh-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.4"
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build launcher
+        working-directory: codetracer-launcher
+        run: bash ./build.sh --target linux-musl-x86_64 --out launcher
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer
+
+      - name: Build bundled composer package
+        working-directory: codetracer-launcher/packaging/composer
+        env:
+          CT_LAUNCHER_VERSION: 0.1.0
+          CT_LAUNCHER_BIN: ${{ github.workspace }}/codetracer-launcher/out/launcher
+          CT_LAUNCHER_TARGET: linux-musl-x86_64
+          # codetracer-php-recorder's PHP-side source lives at src/.
+          # The launcher's build_composer.php vendors this tree under
+          # lib/Recorder/ inside the produced zip.
+          CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-php-recorder/src
+        run: php build_composer.php --out dist
+
+      - name: Smoke-test the composer package
+        working-directory: ${{ runner.temp }}
+        env:
+          ARTIFACT_DIR: ${{ github.workspace }}/codetracer-launcher/packaging/composer/dist
+        run: |
+          mkdir -p compose-test && cd compose-test
+          cat > composer.json <<EOF
+          {
+            "name": "ct/test",
+            "minimum-stability": "dev",
+            "repositories": [
+              { "type": "artifact", "url": "${ARTIFACT_DIR}" }
+            ],
+            "require": { "metacraft-labs/codetracer": "0.1.0" }
+          }
+          EOF
+          composer install --no-progress --no-interaction
+          out=$(./vendor/bin/ct --version)
+          echo "$out"
+          echo "$out" | grep -qE "^ct [0-9]+\.[0-9]+"
