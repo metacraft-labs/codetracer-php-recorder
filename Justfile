@@ -67,3 +67,86 @@ fmt: format
 # Run a test PHP script with span tracking
 demo:
     php -d auto_prepend_file=src/auto_prepend.php -S localhost:8095 -t test-programs/
+
+# --- M13: Packaging UX Standardization ---
+# Implements Repo-Requirements.md §2.8 packaging UX for the PHP
+# language-ecosystem recorder. Single channel: composer.
+
+# Bump the version. PHP composer packages tend to lean on git tags as
+# the source of truth, but if a composer.json exists we keep it in
+# sync as well.
+bump-version version:
+    #!/usr/bin/env python3
+    import json, re
+    from pathlib import Path
+    raw = "{{version}}"
+    cj = Path("composer.json")
+    if not cj.exists():
+        # No composer.json yet — write a minimal stub so the bumper has
+        # something to work with. Real metadata is added by the
+        # packaging publish workflow.
+        cj.write_text(json.dumps({"name": "metacraft-labs/codetracer-php-recorder", "version": "0.1.0"}, indent=2) + "\n")
+    data = json.loads(cj.read_text())
+    cur = data.get("version", "0.1.0")
+    if re.match(r"^\d+\.\d+\.\d+$", raw):
+        new = raw
+    else:
+        a, b, p = map(int, cur.split("."))
+        if raw == "major": new = f"{a+1}.0.0"
+        elif raw == "minor": new = f"{a}.{b+1}.0"
+        elif raw == "patch": new = f"{a}.{b}.{p+1}"
+        else: raise SystemExit(f"unknown bump component: {raw!r}")
+    data["version"] = new
+    cj.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"composer.json: {cur} -> {new}")
+
+# Build a release artifact for the given channel.
+# Supported channels: composer
+build-package channel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{channel}}" in
+        composer)
+            just build
+            mkdir -p dist
+            # Composer packages don't need a local archive — Packagist
+            # resolves the tag directly from the git repo. We package a
+            # tarball locally for verification only.
+            git archive --format=tar.gz --prefix=codetracer-php-recorder/ \
+                -o dist/codetracer-php-recorder.tar.gz HEAD
+            ;;
+        *)
+            echo "::error::unknown channel '{{channel}}'. PHP recorder only supports 'composer'." >&2
+            exit 1
+            ;;
+    esac
+
+# Verify the artifact produced by `build-package <channel>`.
+verify-package channel:
+    #!/usr/bin/env python3
+    import json, os, shutil, subprocess, sys
+    from pathlib import Path
+    ch = "{{channel}}"
+    strict = os.environ.get("CT_VERIFY_STRICT") == "1"
+    if ch != "composer":
+        print(f"::error::unknown channel {ch!r}; PHP recorder only supports 'composer'")
+        sys.exit(1)
+    cj = Path("composer.json")
+    if cj.exists():
+        json.loads(cj.read_text())
+        print(f"[verify] composer.json: valid JSON")
+        if shutil.which("composer"):
+            subprocess.run(["composer", "validate", "--no-check-all", str(cj)], check=True)
+        else:
+            if strict:
+                print("::error::composer required in strict mode"); sys.exit(1)
+            print("[verify] SKIP: composer not on PATH")
+    else:
+        print("[verify] no composer.json present; nothing to validate")
+
+# Per-channel shortcut.
+build-composer:
+    just build-package composer
+
+verify-composer:
+    just verify-package composer

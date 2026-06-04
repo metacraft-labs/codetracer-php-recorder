@@ -1,0 +1,73 @@
+name: publish-composer
+
+# Notifies Packagist that a new tag is available for the
+# `metacraft-labs/codetracer-php-recorder` package. Packagist
+# auto-discovers the new version from the repo's git tags; this
+# workflow simply pings the Packagist webhook so the new version
+# becomes visible without waiting for the next periodic crawl.
+#
+# Fires on `v*` tag pushes (the primary release path) and also
+# accepts a manual workflow_dispatch (per Repo-Requirements.md §2.8.4).
+#
+# Required secrets:
+#   COMPOSER_PACKAGIST_TOKEN   Packagist API token for the
+#                              `metacraft-labs` account.
+#
+# When the token is unset the workflow exits zero with a warning so
+# a fork can dry-run without spurious failure.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver that was tagged (informational)'
+        required: true
+        default: '0.1.0'
+      dry_run:
+        description: 'Skip the Packagist notification'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: composer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate composer.json
+        run: |
+          if [[ -f composer.json ]]; then
+            php -r "json_decode(file_get_contents('composer.json'), true) ?: exit(1);"
+            echo "composer.json: valid JSON"
+          fi
+
+      - name: Notify Packagist
+        if: ${{ github.event_name == 'push' || inputs.dry_run != true }}
+        env:
+          PACKAGIST_TOKEN: ${{ secrets.COMPOSER_PACKAGIST_TOKEN }}
+        run: |
+          if [[ -z "$PACKAGIST_TOKEN" ]]; then
+            echo "::warning::COMPOSER_PACKAGIST_TOKEN not set; skipping Packagist notification."
+            exit 0
+          fi
+          # Packagist's "update from API" endpoint accepts the
+          # username and the API token; the package URL is the
+          # public repo URL.
+          curl -fsS -XPOST \
+            -H 'content-type:application/json' \
+            "https://packagist.org/api/update-package?username=metacraft-labs&apiToken=$PACKAGIST_TOKEN" \
+            -d '{"repository":{"url":"https://github.com/metacraft-labs/codetracer-php-recorder"}}'
+          echo "Packagist notified for v${{ steps.ver.outputs.version }}"
