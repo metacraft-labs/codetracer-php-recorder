@@ -1,5 +1,19 @@
 <?php
 /**
+ * SUPERSEDED BY RS-M7 — kept for history, run by no recipe.
+ *
+ * This file asserts the pre-RS-M7 shape: one trace directory per request plus
+ * a `session_manifest.jsonl` sidecar listing them.  Both are gone.  A worker
+ * now keeps ONE continuous recording and each request is a span inside its
+ * container's own `spans.dat` stream, so there is nothing per-request on disk
+ * and no sidecar to read.
+ *
+ * The replacement is `tests/test_request_spans.php`
+ * (`php_builtin_server_requests_land_in_one_container`), which drives the same
+ * real `php -S` server and asserts on the spans through the canonical Nim
+ * decoder.  Deleting this file is left to RS-M11, which retires the sidecar
+ * compatibility shim across every recorder.
+ *
  * Integration test for per-request web recording.
  *
  * Starts PHP built-in server with web_bootstrap.php,

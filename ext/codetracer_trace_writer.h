@@ -233,6 +233,90 @@ void trace_writer_register_special_event(trace_writer_t handle,
     int kind, const char* metadata, const char* content);
 
 /* --------------------------------------------------------------------------
+ * Request / interval spans (RS-M1)
+ *
+ * A span is a bounded, labeled interval of execution — an HTTP request, a
+ * process, a test — appended to the container's `spans.dat` stream.  This is
+ * what the PHP recorder emits instead of the `session_manifest.jsonl` sidecar
+ * it used to write next to a per-request trace directory (RS-M7).
+ *
+ * Declarations mirror `codetracer-trace-format-nim/include/
+ * codetracer_trace_writer.h`.  They are re-declared here rather than included
+ * because this header is the tracked alias shim (see the FMT_* / TK_* / ELK_*
+ * block above) — see ext/build.sh for why the upstream header is not copied
+ * over this file.
+ * -------------------------------------------------------------------------- */
+
+/* `flags` bits */
+#define SPAN_FLAG_OPEN     0x01u  /* open record; completion still to come */
+#define SPAN_FLAG_EXTERNAL 0x02u  /* execution lives in another container */
+
+/* `status` values */
+#define SPAN_STATUS_UNKNOWN 0u
+#define SPAN_STATUS_OK      1u
+#define SPAN_STATUS_ERROR   2u
+
+/* `structural` bits (Trace-Spans.md 2.4) */
+#define SPAN_STRUCTURAL_CONTIGUOUS      0x01u /* uninterrupted, one thread   */
+#define SPAN_STRUCTURAL_SHARES_TIMELINE 0x02u /* ordering comparable         */
+#define SPAN_STRUCTURAL_CONCURRENT      0x04u /* siblings may overlap        */
+
+/*
+ * external_recording / external_path are read ONLY when SPAN_FLAG_EXTERNAL is
+ * set (pass NULL otherwise).  metadata_keys / metadata_values are parallel
+ * arrays of NUL-terminated UTF-8 strings of length metadata_count; their ORDER
+ * IS PRESERVED end to end, so emit the well-known HTTP keys in display order.
+ * Returns 0 on success, non-zero on failure (see trace_writer_last_error).
+ */
+int trace_writer_register_span(trace_writer_t handle,
+    uint64_t span_id,
+    uint64_t parent_span_id,
+    uint8_t flags,
+    uint8_t status,
+    uint64_t start_wall_ns,
+    uint64_t end_wall_ns,
+    uint64_t process_ord,
+    uint64_t thread_id,
+    uint64_t start_step,
+    uint64_t end_step,
+    const char* external_recording,
+    const char* external_path,
+    const char* span_type,
+    const char* label,
+    uint8_t structural,
+    const char** metadata_keys,
+    const char** metadata_values,
+    size_t metadata_count);
+
+/* Seal the current partial span chunk without closing the writer. */
+int trace_writer_flush_spans(trace_writer_t handle);
+
+/*
+ * The exec-stream index the NEXT event registered on this writer will occupy —
+ * the `start_step` a span opened right now should carry.  A span that runs from
+ * here to there is `start_step = trace_writer_next_step_index()` at entry and
+ * `end_step = trace_writer_next_step_index() - 1` at exit (clamped to
+ * `start_step` when nothing was recorded in between).
+ *
+ * This is the writer's own step counter, NOT a count of
+ * trace_writer_register_step calls: the counter advances for every exec-stream
+ * event (absolute steps, DeltaColumn column moves, raise / catch, thread
+ * start / exit / switch), and that counter is the step id every reader walks.
+ * A recorder counting its own register_step calls would drift the moment it
+ * emitted a column delta or a thread event.
+ */
+uint64_t trace_writer_next_step_index(trace_writer_t handle);
+
+/*
+ * Decode the span stream of the `.ct` container at `path` into a JSON array —
+ * the READ counterpart of trace_writer_register_span.  `settled != 0` applies
+ * last-record-wins per span_id and sorts ascending by span_id; `settled == 0`
+ * returns every record in append order, open records included.  Free with
+ * ct_free_buffer.
+ */
+uint8_t* ct_spans_json(const char* path, int settled, size_t* out_len);
+
+/* --------------------------------------------------------------------------
  * Thread lifecycle events
  *
  * Recorders that observe multi-threaded program execution emit ThreadStart /

@@ -28,6 +28,12 @@ build-ext: build
 # sibling `codetracer-trace-format-nim` checkout.  The flake's shellHook
 # sets `TRACE_FORMAT_NIM_DIR` to that sibling, so we resolve the lib
 # dir from it rather than the legacy `../../` path.
+#   5. RS-M7 request-span integration tests — a real `php -S` process and a
+#      real php-fpm pool recorded end to end, asserted through the canonical
+#      Nim span reader (`ct_spans_json`).  This is the ONLY runner the repo
+#      has, so a test file that is not listed here runs nowhere; several
+#      pre-existing files under tests/ are in exactly that position (see
+#      `test-orphans` below).
 test: build
     php tests/test_span.php
     CODETRACER_ENABLED=1 CODETRACER_OUTPUT_DIR=/tmp/codetracer_test_traces \
@@ -35,6 +41,39 @@ test: build
     php -d extension=ext/modules/codetracer.so tests/test_extension.php
     LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
     php tests/test_e2e.php
+    just test-request-spans
+
+# RS-M7 request-span integration tests only.
+#
+# The extension is loaded in the RUNNER process as well, because the spans are
+# read back through `codetracer_spans_json()` — the canonical Nim decoder,
+# rather than a decoder written for the tests.  CODETRACER_ENABLED is NOT set
+# here on purpose: the harness passes it only to the server processes it
+# spawns, so the runner itself is not recorded.
+test-request-spans: build
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
+    php -d extension=ext/modules/codetracer.so tests/test_request_spans.php
+
+# Report test files under tests/ that no recipe runs.
+#
+# The repo has no auto-discovering runner, so an unlisted test file is dead
+# code that still looks like coverage.  This recipe names them instead of
+# letting them rot silently; it does not fail the build, because the files it
+# finds predate RS-M7 and adopting them is a separate piece of work.
+test-orphans:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    orphans=()
+    for f in tests/test_*.php; do
+        base="$(basename "$f")"
+        if ! grep -q "$base" Justfile; then orphans+=("$base"); fi
+    done
+    if [ ${#orphans[@]} -eq 0 ]; then
+        echo "[test-orphans] every tests/test_*.php is wired into a recipe"
+    else
+        echo "[test-orphans] NOT run by any recipe:"
+        printf '  %s\n' "${orphans[@]}"
+    fi
 
 t: test
 
@@ -67,6 +106,62 @@ fmt: format
 # Run a test PHP script with span tracking
 demo:
     php -d auto_prepend_file=src/auto_prepend.php -S localhost:8095 -t test-programs/
+
+# --- RS-M7: Request Panel demo + fixture ---
+
+# Record the demo session and (unless CODETRACER_DEMO_RECORD_ONLY is set) open
+# it in the GUI.  Invoked directly, or as the recording half of codetracer's
+# `just demo-request-panel php`.
+demo-request-panel-php SERVER="builtin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    demo_dir="${CODETRACER_DEMO_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/codetracer/demos/request-panel-php}"
+    echo "=== RS-M7 Request Panel demo — php/{{SERVER}} ==="
+    just build
+    rm -rf "$demo_dir"
+    mkdir -p "$demo_dir"
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
+      php -d extension=ext/modules/codetracer.so \
+          tests/programs/web/session_driver.php \
+          --trace-dir "$demo_dir" --print-spans
+    # One worker, one container.  `ct replay -t` wants the directory holding
+    # the .ct, which for a recorded worker is $demo_dir/worker_<pid>.
+    worker_dir="$(dirname "$(ls "$demo_dir"/worker_*/*.ct | head -n1)")"
+    echo "[demo] recorded session in $worker_dir"
+    if [ -n "${CODETRACER_DEMO_RECORD_ONLY:-}" ]; then
+      # Invoked as the container-production half of codetracer's
+      # `just demo-request-panel php`, which opens the GUI itself.
+      echo "$worker_dir" > "$demo_dir/.worker_dir"
+      exit 0
+    fi
+    if command -v ct >/dev/null 2>&1; then
+      echo "[demo] launching the GUI; the REQUESTS panel docks itself once the"
+      echo "[demo] first delta arrives (bottom edge strip if you close it)."
+      exec ct replay -t "$worker_dir"
+    fi
+    echo "[demo] no 'ct' on PATH — open it by hand with:"
+    echo "         ct replay -t $worker_dir"
+    echo "[demo] (or run this through codetracer's recipe, which supplies ct:"
+    echo "         direnv exec ../codetracer just demo-request-panel php)"
+
+# Record the checked-in ViewModel-test fixture into OUT.
+#
+# OUT ends up holding the single `app.ct` container, flattened out of the
+# worker_<pid> directory so the fixture path is stable across machines.
+record-request-panel-fixture OUT:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just build
+    rm -rf "{{OUT}}"
+    mkdir -p "{{OUT}}"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
+      php -d extension=ext/modules/codetracer.so \
+          tests/programs/web/session_driver.php \
+          --trace-dir "$tmp" --print-spans
+    cp "$(ls "$tmp"/worker_*/*.ct | head -n1)" "{{OUT}}/app.ct"
+    echo "[fixture] wrote {{OUT}}/app.ct"
 
 # --- M13: Packaging UX Standardization ---
 # Implements Repo-Requirements.md §2.8 packaging UX for the PHP

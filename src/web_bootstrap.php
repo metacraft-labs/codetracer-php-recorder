@@ -1,68 +1,59 @@
 <?php
 /**
- * CodeTracer PHP Web Bootstrap.
+ * CodeTracer PHP web bootstrap (RS-M7).
  *
- * Include via auto_prepend_file to enable per-request recording.
- * Each request gets its own trace directory.
+ * Include via `auto_prepend_file` when you want the recorder to label the
+ * requests it is already recording:
  *
- * Usage:
- *   php -d auto_prepend_file=/path/to/web_bootstrap.php -S localhost:8080
- *   Or in php-fpm pool: php_admin_value[auto_prepend_file] = /path/to/web_bootstrap.php
+ *     php -d auto_prepend_file=/path/to/web_bootstrap.php -S localhost:8080
+ *     ; or in a php-fpm pool:
+ *     php_admin_value[auto_prepend_file] = /path/to/web_bootstrap.php
+ *
+ * WHAT CHANGED IN RS-M7
+ *
+ * This file used to create a per-request trace directory, point the C
+ * extension at it through CODETRACER_TRACE_DIR, and append a line to a
+ * `session_manifest.jsonl` sidecar next to it.  All three are gone:
+ *
+ *   * the recorder now keeps ONE continuous recording per worker and marks
+ *     each request as a span over that timeline, so there is no per-request
+ *     directory to create;
+ *   * request metadata lives in the container's own `spans.dat` stream, so
+ *     there is no sidecar to write, find, tail or keep in sync — see
+ *     `codetracer-specs/Trace-Files/CTFS-Request-Span-Streams.md`.
+ *
+ * What is left is the part the C extension genuinely cannot do on its own:
+ * naming the framework, and letting the application contribute a route
+ * pattern and an error message.  Everything else — method, URL, status,
+ * duration, response size, remote address, and the step range the request
+ * occupies — the extension observes directly.
+ *
+ * Including this file is entirely optional.  Without it the recorder still
+ * emits a complete `web-request` span per request.
  */
 
-require_once __DIR__ . '/span.php';
-require_once __DIR__ . '/ct_runtime.php';
+if (getenv('CODETRACER_ENABLED') === '1' &&
+    function_exists('codetracer_span_annotate')) {
 
-$__ct_enabled = getenv('CODETRACER_ENABLED') === '1';
+    $__ct_framework = getenv('CODETRACER_FRAMEWORK');
+    if (is_string($__ct_framework) && $__ct_framework !== '') {
+        codetracer_span_annotate('framework', $__ct_framework);
+    }
 
-if ($__ct_enabled) {
-    $__ct_base_dir = getenv('CODETRACER_OUTPUT_DIR') ?: '/tmp/codetracer_traces';
-    $__ct_method = $_SERVER['REQUEST_METHOD'] ?? 'CLI';
-    $__ct_uri = $_SERVER['REQUEST_URI'] ?? $_SERVER['SCRIPT_NAME'] ?? 'unknown';
-
-    // Create per-request trace directory
-    $__ct_safe_uri = preg_replace('/[^a-zA-Z0-9_-]/', '_', $__ct_uri);
-    $__ct_trace_dir = sprintf('%s/%s_%s_%s_%d',
-        $__ct_base_dir,
-        date('Ymd_His'),
-        strtolower($__ct_method),
-        substr($__ct_safe_uri, 0, 50),
-        getmypid()
-    );
-
-    if (!is_dir($__ct_base_dir)) @mkdir($__ct_base_dir, 0755, true);
-    @mkdir($__ct_trace_dir, 0755, true);
-
-    // Set trace dir for the runtime
-    putenv("CODETRACER_TRACE_DIR=$__ct_trace_dir");
-
-    // Begin span tracking
-    $__ct_span = CodeTracerSpan::begin();
-
-    // Register shutdown to end span and flush trace
-    register_shutdown_function(function() use ($__ct_span, $__ct_trace_dir) {
-        $statusCode = http_response_code() ?: 200;
-        $__ct_span->end($statusCode);
-
-        // Write session manifest entry.
-        // The entry uses the span manifest format expected by `ct print`:
-        // a top-level "metadata" object with http.* fields, plus "status".
-        $manifestPath = dirname($__ct_trace_dir) . '/session_manifest.jsonl';
-        $method = $_SERVER['REQUEST_METHOD'] ?? 'CLI';
-        $url = $_SERVER['REQUEST_URI'] ?? 'unknown';
-        $durationMs = $__ct_span->getDurationMs();
-        $entry = json_encode([
-            'trace_dir' => $__ct_trace_dir,
-            'span_type' => 'web-request',
-            'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
-            'status' => ($statusCode >= 400) ? 'error' : 'ok',
-            'metadata' => [
-                'http.method' => $method,
-                'http.url' => $url,
-                'http.status_code' => (string) $statusCode,
-                'http.duration_ms' => (string) $durationMs,
-            ],
-        ], JSON_UNESCAPED_SLASHES) . "\n";
-        @file_put_contents($manifestPath, $entry, FILE_APPEND | LOCK_EX);
+    // Annotate at shutdown so a router that resolves late (every framework
+    // does) has had its chance to publish a route.  The extension settles the
+    // span in its own RSHUTDOWN, which runs after userland shutdown
+    // functions, so anything added here still lands on the record.
+    register_shutdown_function(static function (): void {
+        $route = getenv('CODETRACER_ROUTE');
+        if (is_string($route) && $route !== '') {
+            codetracer_span_annotate('http.route', $route);
+        }
+        $error = error_get_last();
+        if ($error !== null && in_array($error['type'],
+                [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+            codetracer_span_annotate('error.message',
+                $error['message'] . ' at ' . $error['file'] . ':' . $error['line']);
+        }
     });
 }
