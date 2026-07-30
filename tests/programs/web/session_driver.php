@@ -25,8 +25,16 @@
  *      one child in three did.  The extension therefore closes its container
  *      from the SIGQUIT/SIGTERM handler it installs per worker.
  *   3. php-fpm's default `process_control_timeout = 0` makes the master
- *      escalate SIGQUIT -> SIGTERM -> SIGKILL with no gap, so no worker gets
- *      to shut down at all.  The generated pool config sets a real timeout.
+ *      escalate SIGQUIT -> SIGTERM -> SIGKILL with no gap, so a worker that
+ *      waits for `php_module_shutdown()` never gets to shut down at all — the
+ *      whole reason fact 2's handler writes the container from the signal
+ *      itself.  `CtFpmPoolSession` can therefore be built either way: with an
+ *      explicit `process_control_timeout` (the friendly configuration) or with
+ *      php-fpm's own default (the hostile one, which is what an unconfigured
+ *      deployment actually runs).  See
+ *      `php_fpm_default_control_timeout_still_writes_every_container` in
+ *      tests/test_request_spans.php, which fails outright if the extension
+ *      stops handling the signal.
  *
  * A SIGKILL still skips everything and the worker's whole recording is lost —
  * see the note on `ct_worker_close()` in ext/codetracer_php.c.
@@ -357,11 +365,23 @@ final class CtFpmPoolSession extends CtWebSession
     private string $confPath;
     private string $pidPath;
     private int $masterPid = 0;
+    /** `null` = leave php-fpm's own default (0), i.e. no grace period. */
+    private ?string $processControlTimeout;
 
-    public function __construct(string $outputDir, int $workers = 4)
+    /**
+     * @param ?string $processControlTimeout php-fpm's `process_control_timeout`
+     *        for this pool.  `'10s'` gives workers a grace period in which a
+     *        conventional shutdown path can run; `null` omits the directive and
+     *        leaves php-fpm's default of 0, under which the master escalates
+     *        SIGQUIT -> SIGTERM -> SIGKILL with no gap and only a worker that
+     *        writes its container FROM the signal handler survives.
+     */
+    public function __construct(string $outputDir, int $workers = 4,
+                                ?string $processControlTimeout = '10s')
     {
         parent::__construct($outputDir);
         $this->workers = $workers;
+        $this->processControlTimeout = $processControlTimeout;
         $this->confPath = $outputDir . '/php-fpm.conf';
         $this->pidPath = $outputDir . '/php-fpm.pid';
     }
@@ -373,6 +393,16 @@ final class CtFpmPoolSession extends CtWebSession
 
     private function writeConf(): void
     {
+        // Without an explicit control timeout the master escalates
+        // SIGQUIT -> SIGTERM -> SIGKILL with no gap between them, so a worker
+        // never gets to finish shutting down the conventional way.  Which of
+        // the two the pool runs with is the variable the default-timeout test
+        // turns; omitting the directive is NOT the same as writing `0`, since
+        // this must exercise what an unconfigured php-fpm really does.
+        $controlTimeout = $this->processControlTimeout === null
+            ? '; process_control_timeout left at php-fpm\'s default (0)'
+            : 'process_control_timeout = ' . $this->processControlTimeout;
+
         // `pm = static` with `pm.max_children = N` guarantees N workers are
         // alive from the start, which is what makes "several workers under
         // concurrent load" a property of the run rather than a hope.
@@ -381,10 +411,7 @@ final class CtFpmPoolSession extends CtWebSession
         pid = {$this->pidPath}
         error_log = {$this->outputDir}/php-fpm.log
         daemonize = no
-        ; Without an explicit control timeout the master escalates
-        ; SIGQUIT -> SIGTERM -> SIGKILL with no gap between them, so a worker
-        ; never gets to finish shutting down.  Give it real time.
-        process_control_timeout = 10s
+        {$controlTimeout}
 
         [ct]
         listen = 127.0.0.1:{$this->port}

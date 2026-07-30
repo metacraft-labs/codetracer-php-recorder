@@ -7,6 +7,7 @@
 #include "ext/standard/info.h"
 #include "SAPI.h"
 #include "php_codetracer.h"
+#include "Zend/zend_signal.h"
 #include "codetracer_trace_writer.h"
 
 #include <stdio.h>
@@ -18,6 +19,7 @@
 #include <sys/types.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <ucontext.h>
 
 /* Global state */
 static void (*original_zend_execute_ex)(zend_execute_data *execute_data);
@@ -80,6 +82,26 @@ typedef struct _ct_worker_state {
     int      writer_ready;   /* begin_events succeeded                      */
     int      requests_seen;  /* PHP_RINITs served by THIS process           */
     volatile sig_atomic_t shutdown_requested; /* set from a signal handler   */
+    /*
+     * "The request path owns the writer right now."
+     *
+     * THE flag the shutdown signal handler consults, and the reason it is a
+     * `volatile sig_atomic_t` and not an `int`: C11 §7.14.1.1p5 lets a signal
+     * handler touch exactly two kinds of object, and this is one of them.
+     *
+     * It is set at the TOP of the recording path in PHP_RINIT — before
+     * `ct_worker_open()`, before `ensure_function_id`, before `register_call`
+     * — and cleared in PHP_RSHUTDOWN only AFTER the last writer call of the
+     * request (`ct_span_settle()`'s `register_span`) has returned.  So it
+     * brackets EVERY mutation of the writer, not just the part of the request
+     * during which a span happens to be open.
+     *
+     * It is deliberately NOT `span_active`: a CLI run mutates the writer in
+     * exactly the same way but must never register a `web-request` span (see
+     * `ct_is_http_request()`), so the two conditions are genuinely different
+     * and one flag cannot mean both.
+     */
+    volatile sig_atomic_t writer_busy;
     uint64_t next_span_id;   /* 1-based, monotonic WITHIN the container     */
 
     /* --- per-request state --------------------------------------------
@@ -89,8 +111,13 @@ typedef struct _ct_worker_state {
      * span" silently loses one), so the request/response pair IS the
      * enclosing frame here.  `span_active` still guards the settle path so
      * a second RSHUTDOWN can never append a duplicate record.
+     *
+     * `volatile sig_atomic_t` rather than `int` because its lifetime is
+     * nested inside `writer_busy`'s and the invariant "span_active implies
+     * writer_busy" is one the signal path relies on; keeping both types the
+     * same removes any question of a torn or reordered read.
      */
-    int      span_active;
+    volatile sig_atomic_t span_active;
     uint64_t span_id;
     uint64_t start_step;
     uint64_t start_wall_ns;
@@ -623,12 +650,76 @@ static void ct_worker_open(const char *program)
  * drainer of `CTFS-Request-Span-Streams.md` § "Writing from many processes";
  * neither exists in the FFI today.  See tests/test_web_integration.php.
  */
-static int ct_closed = 0;
+/*
+ * `volatile sig_atomic_t`, not `int`: ct_worker_close() runs both from the
+ * request path (PHP_MSHUTDOWN, atexit, PHP_RSHUTDOWN) and from the shutdown
+ * signal handler, so this guard is read and written from a signal context.
+ */
+static volatile sig_atomic_t ct_closed = 0;
 
 static void ct_worker_close(void)
 {
+    sigset_t stop_signals, previous_mask;
+    int mask_installed;
+
     if (ct_closed) return;
     ct_closed = 1;
+
+    /*
+     * The close is UNINTERRUPTIBLE by a stop signal.
+     *
+     * Writing the container is the one part of this recorder that cannot be
+     * retried: `trace_writer_close()` is what puts the whole in-memory CTFS
+     * container on disk, so a stop signal landing halfway through loses
+     * everything the worker recorded, not a suffix of it.
+     *
+     * That is not hypothetical.  Under php-fpm's DEFAULT
+     * `process_control_timeout = 0` the master does not pace its escalation
+     * at all; `fpm_pctl_action_next()` sends
+     *
+     *     kill(child, SIGQUIT)      <- this close starts
+     *     kill(child, SIGTERM)      <- lands mid-close; our SIGTERM chain
+     *                                  ends at SIG_DFL, so the worker dies
+     *
+     * with a zero timeout between the two.
+     *
+     * Which callers this block actually protects, measured with a probe that
+     * reports the effective mask on entry here (php-fpm 8.4.21, four static
+     * workers, default control timeout):
+     *
+     *   reached from ct_shutdown_signal_handler   SIGQUIT+SIGTERM ALREADY
+     *                                             blocked, but not by us
+     *   reached from PHP_MSHUTDOWN / ct_atexit    nothing blocked
+     *   reached from PHP_RSHUTDOWN, after the
+     *     handler deferred via shutdown_requested nothing blocked
+     *
+     * The first row is Zend's doing: `zend_sigaction()` installs
+     * `zend_signal_handler_defer` with `sa_mask = global_sigmask`, which is
+     * `sigfillset()` minus a dozen synchronous/fatal signals — SIGQUIT and
+     * SIGTERM stay in it.  So on the signal path this block is REDUNDANT, and
+     * removing it does not make
+     * `php_fpm_default_control_timeout_still_writes_every_container` fail
+     * (measured: 4/4 containers in 5/5 runs with the block deleted).  The
+     * other two rows are what need it: they run in ordinary context with
+     * nothing blocked, and that is where the escalation above kills a worker
+     * mid-write.
+     *
+     * `sigprocmask()` rather than the handler's own `sa_mask` because
+     * `zend_sigaction()` DISCARDS the `sa_mask` we hand it (see
+     * ct_arm_shutdown_signals) — it keeps only our handler pointer and flags.
+     * It is async-signal-safe, so it is legal on the path that reaches this
+     * from the handler.  The pending signal is delivered the moment the mask
+     * is restored, so nothing is swallowed — the stop is delayed by exactly
+     * one close.
+     *
+     * Single exit path below on purpose: the only `return` in this function
+     * is the `ct_closed` guard, above the SIG_BLOCK.
+     */
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGQUIT);
+    sigaddset(&stop_signals, SIGTERM);
+    mask_installed = (sigprocmask(SIG_BLOCK, &stop_signals, &previous_mask) == 0);
+
     ct_debug("worker close: writer=%p owner_pid=%d requests=%d",
              (void *)trace_writer,
              ct_state ? (int)ct_state->owner_pid : -1,
@@ -675,6 +766,9 @@ static void ct_worker_close(void)
         free(output_dir);
         output_dir = NULL;
     }
+
+    /* The container is on disk; a stop signal may now proceed. */
+    if (mask_installed) sigprocmask(SIG_SETMASK, &previous_mask, NULL);
 }
 
 /* --------------------------------------------------------------------------
@@ -698,22 +792,48 @@ static int ct_signals_installed = 0;
  * stop), so that is where the container gets written.  Two rules keep this
  * out of trouble:
  *
- *   - If a request is in flight, the handler only records that shutdown was
- *     asked for.  PHP_RSHUTDOWN settles the span and closes then, so the
- *     writer is never mutated from a signal context while the request path is
- *     in the middle of mutating it.
+ *   - If the request path owns the writer (`writer_busy`), the handler only
+ *     records that shutdown was asked for.  PHP_RSHUTDOWN settles the span
+ *     and closes then, so the writer is never mutated from a signal context
+ *     while the request path is in the middle of mutating it.
  *   - If the worker is idle (the normal case: it is blocked in `accept()`),
  *     the close happens here.  Nothing else is touching the writer.
  *
+ * The predicate is `writer_busy`, NOT `span_active`.  `span_active` is 0 for
+ * three stretches during which the writer is very much being mutated, and a
+ * close in any of them frees the writer underneath the request path:
+ *
+ *   1. PHP_RINIT from its first statement until `ct_span_begin()` — the
+ *      `ct_worker_open()`, `ensure_function_id` and `register_call` calls.
+ *   2. The whole body of a CLI (non-HTTP) run, which never opens a span at
+ *      all yet records every step of the script.
+ *   3. PHP_RSHUTDOWN between `ct_span_settle()` clearing the flag and its
+ *      `trace_writer_register_span()` returning.
+ *
+ * `writer_busy` spans all three: RINIT sets it before touching the writer and
+ * RSHUTDOWN clears it after the last writer call has returned.
+ *
  * The previously installed handler is always chained, so FPM's own shutdown
  * logic still runs exactly as it would have.
+ *
+ * One caveat on the `ct_debug()` below, since the `writer_busy` comment cites
+ * C11 §7.14.1.1p5 and a reader could infer more rigour than is here: `ct_debug`
+ * goes through `getenv`/`fopen`/`fprintf`, none of which are async-signal-safe.
+ * It is kept anyway because it is the only instrument that answers "did this
+ * handler actually run?" — the question a previous unreproducible measurement
+ * of this code turned on — and because `ct_worker_close()` already calls it on
+ * this same path.  It is inert unless CODETRACER_DEBUG is set, so no
+ * production run takes the risk.
  */
 static void ct_shutdown_signal_handler(int signo)
 {
     int saved_errno = errno;
     struct sigaction *prev = (signo == SIGQUIT) ? &ct_prev_quit : &ct_prev_term;
 
-    if (ct_state && !ct_state->span_active) {
+    ct_debug("stop signal %d: state=%p writer_busy=%d closed=%d", signo,
+             (void *)ct_state,
+             ct_state ? (int)ct_state->writer_busy : -1, (int)ct_closed);
+    if (ct_state && !ct_state->writer_busy) {
         ct_worker_close();
     } else if (ct_state) {
         ct_state->shutdown_requested = 1;
@@ -722,7 +842,32 @@ static void ct_shutdown_signal_handler(int signo)
     errno = saved_errno;
 
     if (prev->sa_flags & SA_SIGINFO) {
-        if (prev->sa_sigaction) prev->sa_sigaction(signo, NULL, NULL);
+        /*
+         * Chain into an SA_SIGINFO handler with SYNTHESISED arguments rather
+         * than with NULL.  A three-argument handler is entitled to
+         * dereference both of them — `info->si_code`, `info->si_pid` and
+         * `uc->uc_sigmask` are ordinary things for one to read — and passing
+         * NULL would fault it inside a signal context, turning a graceful
+         * stop into a SIGSEGV.  Zeroed structures read as "no information"
+         * instead, which is a value every handler can cope with.
+         *
+         * Unreachable with php-fpm today (it installs plain `sa_handler`
+         * handlers), which is exactly why it must not be left as a trap for
+         * whatever installs a handler here next.
+         */
+        if (prev->sa_sigaction) {
+            siginfo_t info;
+            ucontext_t uctx;
+            memset(&info, 0, sizeof(info));
+            memset(&uctx, 0, sizeof(uctx));
+            info.si_signo = signo;
+            /* What the kernel reports for a kill(2)-delivered signal, which
+             * is what this is from the chained handler's point of view. */
+            info.si_code = SI_USER;
+            info.si_pid = getpid();
+            info.si_uid = getuid();
+            prev->sa_sigaction(signo, &info, &uctx);
+        }
     } else if (prev->sa_handler == SIG_DFL) {
         struct sigaction dfl;
         memset(&dfl, 0, sizeof(dfl));
@@ -735,22 +880,103 @@ static void ct_shutdown_signal_handler(int signo)
 }
 
 /*
- * Installed from the first PHP_RINIT of a worker, not from PHP_MINIT: FPM
- * installs its own child handlers in `fpm_signals_init_child()` AFTER the
- * fork, so anything registered in the master's PHP_MINIT would be replaced.
+ * Arm the stop-signal handlers for this request.
+ *
+ * Called from EVERY PHP_RINIT, and through `zend_sigaction()` rather than
+ * `sigaction()`.  Both of those are forced by how Zend owns the signal slots
+ * (`Zend/zend_signal.c`):
+ *
+ *   - `zend_signal_activate()`, which runs at every request start, begins with
+ *     `memcpy(&SIGG(handlers), &global_orig_handlers, ...)` — it restores the
+ *     table of "handlers to forward to" from a snapshot taken at PROCESS
+ *     STARTUP by `zend_signal_init()`.  Under FPM that snapshot is taken in
+ *     the CHILD, at the end of `fpm_signals_init_child()`, which is why it
+ *     holds the child's own handlers (see below) and not the master's.
+ *     Either way, anything an extension put there afterwards is dropped.
+ *   - It then calls `zend_signal_register(sig, zend_signal_handler_defer)`,
+ *     which FIRST checks whether `zend_signal_handler_defer` is already the
+ *     installed handler and returns early if so — WITHOUT re-saving what is
+ *     there.
+ *
+ * A one-shot raw `sigaction()` from the first PHP_RINIT therefore survives
+ * exactly two requests: request 2's activate saves it (our handler is the
+ * installed one at that moment), and request 3's activate wipes it and then
+ * declines to save anything because `defer` is already installed.  From the
+ * third request on the worker has no CodeTracer stop handler at all, and a
+ * pool stop loses its whole recording.
+ *
+ * Measured with the one-shot install, four static workers, graceful pool stop
+ * under the default control timeout, counting entries to the handler:
+ *
+ *   1 request per worker    4/4 containers,      4 handler entries
+ *   2 requests per worker   4/4 containers, 24599 handler entries  (!)
+ *   3 requests per worker   1/4 containers, 18497 handler entries  (!)
+ *   6 requests per worker   0/4 containers,      0 handler entries
+ *
+ * The runaway counts are the second half of the same bug.  At the request-2
+ * activate our handler is what `zend_signal_register()` saves into
+ * `SIGG(handlers)`, while `ct_prev_quit` still holds the `defer` entry the
+ * one-shot `sigaction()` displaced — so chaining ran defer, which dispatched
+ * straight back to us.  Arming through `zend_sigaction()` cannot produce that
+ * cycle: `oldact` comes out of `SIGG(handlers)`, which is where Zend forwards
+ * from, so it can never name this function.  With the arming below the same
+ * runs give 4/4 containers and exactly 2 entries per worker (SIGQUIT then
+ * SIGTERM, the second short-circuiting on `ct_closed`).
+ *
+ * `zend_sigaction()` is the supported way in.  It writes our handler into
+ * `SIGG(handlers)` and leaves `zend_signal_handler_defer` installed, so Zend
+ * forwards the signal to us; `oldact` yields whatever Zend would have called
+ * instead (php-fpm's `sig_soft_quit` for SIGQUIT, SIG_DFL for SIGTERM), which
+ * is what we chain to.  Re-arming per request is what keeps it in place
+ * across the per-request `memcpy`.  On a PHP built without ZEND_SIGNALS
+ * `Zend/zend_signal.h` maps `zend_sigaction` straight to `sigaction`, so the
+ * same code is correct there too.
+ *
+ * Never from PHP_MINIT: under FPM that runs in the pre-fork master, and
+ * `fpm_signals_init_child()` replaces the child's handlers after the fork.
  */
-static void ct_install_shutdown_signals(void)
+static void ct_arm_shutdown_signals(void)
 {
-    struct sigaction act;
-    if (ct_signals_installed) return;
-    ct_signals_installed = 1;
+    struct sigaction act, previous;
+
     memset(&act, 0, sizeof(act));
+    memset(&previous, 0, sizeof(previous));
     act.sa_handler = ct_shutdown_signal_handler;
     act.sa_flags = SA_RESTART;
+    /*
+     * `sa_mask` is empty on purpose, and is NOT where the "a close is not
+     * interrupted" guarantee comes from: on a ZEND_SIGNALS build
+     * `zend_sigaction()` throws this field away and installs
+     * `zend_signal_handler_defer` with `global_sigmask` instead, so whatever
+     * we put here is never what the kernel applies.  That guarantee is the
+     * `sigprocmask()` around the body of `ct_worker_close()` — see the
+     * comment there.
+     */
     sigemptyset(&act.sa_mask);
-    sigaction(SIGQUIT, &act, &ct_prev_quit);
-    sigaction(SIGTERM, &act, &ct_prev_term);
-    ct_debug("shutdown signal handlers installed");
+
+    zend_sigaction(SIGQUIT, &act, &previous);
+    /*
+     * Never chain to ourselves — a self-chain is unbounded recursion in a
+     * signal context, and it is exactly what the pre-existing one-shot
+     * `sigaction()` produced (~20k handler entries; see the table above).
+     *
+     * On a ZEND_SIGNALS build this is belt-and-braces: `oldact` is read out of
+     * `SIGG(handlers)`, which the per-request `memcpy` has just reset to the
+     * startup snapshot, so it cannot name this function.  On a build WITHOUT
+     * ZEND_SIGNALS it is load-bearing: `zend_sigaction` is then plain
+     * `sigaction`, so from the second request on `previous` IS this handler
+     * every time, and the check is what preserves the real chain target.
+     */
+    if (previous.sa_handler != ct_shutdown_signal_handler) ct_prev_quit = previous;
+
+    memset(&previous, 0, sizeof(previous));
+    zend_sigaction(SIGTERM, &act, &previous);
+    if (previous.sa_handler != ct_shutdown_signal_handler) ct_prev_term = previous;
+
+    if (!ct_signals_installed) {
+        ct_signals_installed = 1;
+        ct_debug("shutdown signal handlers armed");
+    }
 }
 
 /*
@@ -903,10 +1129,11 @@ static void ct_span_settle(void)
     size_t n = 0, i;
 
     if (!st || !st->span_active) return;
-    /* Idempotent: a second settle can never append a duplicate record. */
-    st->span_active = 0;
 
-    if (!trace_writer || !st->writer_ready) return;
+    if (!trace_writer || !st->writer_ready) {
+        st->span_active = 0;
+        return;
+    }
 
     /* `end_step` is the LAST step inside the span, one before the next index.
      * A request during which nothing was recorded collapses to the step it
@@ -971,6 +1198,14 @@ static void ct_span_settle(void)
         label,
         (uint8_t)(SPAN_STRUCTURAL_CONTIGUOUS | SPAN_STRUCTURAL_SHARES_TIMELINE),
         keys, values, n);
+
+    /* Cleared only NOW, after the last writer call of the span has returned.
+     * Clearing it first (as this used to) opened a window in which
+     * `codetracer_span_annotate()` would silently start refusing a span that
+     * is still being written, and — before `writer_busy` existed — one in
+     * which a stop signal freed the writer between the two calls above.
+     * Still idempotent: a second settle finds the flag clear and returns. */
+    st->span_active = 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -1152,6 +1387,14 @@ PHP_RINIT_FUNCTION(codetracer)
         return SUCCESS;
     }
 
+    /* From here to the matching clear in PHP_RSHUTDOWN, THIS path owns the
+     * writer.  A stop signal arriving inside the bracket only sets
+     * `shutdown_requested`; the container is written from PHP_RSHUTDOWN once
+     * the last writer call has returned.  The flag goes up BEFORE
+     * `ct_worker_open()` so that even the open itself — which allocates the
+     * writer and runs `begin_events` — cannot be freed out from under us. */
+    ct_state->writer_busy = 1;
+
     /* Open the writer if this process does not have one yet.  Covers CLI (the
      * script path is only known now) and every PHP-FPM worker (PHP_MINIT ran
      * in the pre-fork master, so `owner_pid` names a different process). */
@@ -1162,10 +1405,13 @@ PHP_RINIT_FUNCTION(codetracer)
         }
         if (!program || !program[0]) program = "php";
         ct_worker_open(program);
-        ct_install_shutdown_signals();
     }
 
     if (!trace_writer) return SUCCESS;
+
+    /* Every request, not only the first: Zend resets the forwarding table at
+     * each request start.  See ct_arm_shutdown_signals(). */
+    ct_arm_shutdown_signals();
 
     ct_state->requests_seen++;
     tracing_enabled = 1;
@@ -1210,6 +1456,12 @@ PHP_RSHUTDOWN_FUNCTION(codetracer)
     }
     in_io_hook = 0;
     in_trace_hook = 0;
+    /* The last writer call of this request has returned, so the request path
+     * no longer owns the writer.  Cleared unconditionally: PHP_RINIT raises it
+     * before the writer even exists and can leave early (no writer, tracing
+     * turned off mid-flight), and a flag left raised would park the handler in
+     * "defer" forever and lose the container. */
+    if (ct_state) ct_state->writer_busy = 0;
     /* A stop signal arrived mid-request: the span is settled now, so this is
      * the first safe moment to write the container. */
     if (ct_state && ct_state->shutdown_requested) {

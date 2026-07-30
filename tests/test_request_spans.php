@@ -2,10 +2,11 @@
 /**
  * RS-M7 — PHP web-request span emission.
  *
- * Three integration tests over REAL servers recording a REAL application:
+ * Four integration tests over REAL servers recording a REAL application:
  *
  *   php_builtin_server_requests_land_in_one_container
  *   php_fpm_multi_worker_requests_all_appear
+ *   php_fpm_default_control_timeout_still_writes_every_container
  *   php_interning_shared_across_requests
  *
  * MOCKS: none.  Every test starts an actual `php -S` process or an actual
@@ -332,6 +333,121 @@ function test_php_fpm_multi_worker_requests_all_appear(): void
 }
 
 // ===========================================================================
+// php_fpm_default_control_timeout_still_writes_every_container
+// ===========================================================================
+
+/**
+ * The regression guard on the SIGQUIT/SIGTERM handler in ext/codetracer_php.c.
+ *
+ * `php_fpm_multi_worker_requests_all_appear` above runs its pool with an
+ * explicit `process_control_timeout = 10s`, and under that setting the workers
+ * survive long enough to write their containers by a conventional route — so
+ * that test passes with the signal handler deleted and proves nothing about
+ * it.  php-fpm's DEFAULT is `process_control_timeout = 0`, under which the
+ * master escalates SIGQUIT -> SIGTERM -> SIGKILL with no gap and a worker that
+ * has not already written its container by the time it returns from the
+ * SIGQUIT handler never writes one at all.  That is the configuration an
+ * unconfigured deployment runs, and the only configuration in which the
+ * handler is load-bearing.
+ *
+ * Measured, four static workers, all idle at stop time:
+ *
+ *   handler removed, timeout 10s        -> 4/4 containers   (proves nothing)
+ *   handler removed, timeout default(0) -> 0/4 containers   <- this test
+ *   handler present, timeout default(0) -> 4/4 containers
+ *
+ * The assertion is deliberately "every worker that OPENED a recording also
+ * wrote its container": the `worker_<pid>` directories are created when the
+ * writer opens, at the worker's first request, so they are there either way
+ * and the comparison cannot be satisfied by a pool that recorded nothing.
+ */
+function test_php_fpm_default_control_timeout_still_writes_every_container(): void
+{
+    echo "\n==> php_fpm_default_control_timeout_still_writes_every_container\n";
+
+    $dir = ct_tempdir('fpmdefault');
+    $workers = 4;
+    $perWorker = 6;
+    $total = $workers * $perWorker;
+
+    $urls = ['/api/users', '/api/users/2', '/api/users/999', '/api/boom',
+             '/static/app.css', '/api/reports/slow'];
+    $requests = [];
+    for ($i = 0; $i < $total; $i++) {
+        $requests[] = ['GET', $urls[$i % count($urls)]];
+    }
+
+    // The ONLY difference from php_fpm_multi_worker_requests_all_appear: no
+    // process_control_timeout in the pool config, i.e. php-fpm's own default.
+    $session = new CtFpmPoolSession($dir, $workers, null);
+    $session->start();
+
+    $conf = (string) file_get_contents($dir . '/php-fpm.conf');
+    ct_check(!preg_match('/^\s*process_control_timeout\s*=/m', $conf),
+        'the pool really does run with php-fpm\'s default control timeout');
+
+    try {
+        $results = ct_fcgi_concurrent(
+            $session->port(), $requests, ct_web_app_path());
+        $served = 0;
+        foreach ($results as $r) {
+            if ($r[0] > 0) {
+                $served++;
+            }
+        }
+        ct_eq($total, $served, "all $total concurrent requests were served");
+    } finally {
+        // Graceful stop, exactly as a `systemctl reload` / container stop does
+        // it.  With no control timeout this is where an unhandled worker dies.
+        $session->stop();
+    }
+
+    $pids = $session->workerPids();
+    $containers = $session->containers();
+    ct_check(count($pids) >= 2,
+        'the load was spread over at least two workers, got ' . count($pids));
+    // THE assertion: no worker was killed before its container reached disk.
+    ct_eq(count($pids), count($containers),
+        count($pids) . ' worker(s) opened a recording but only ' .
+        count($containers) . ' container(s) were written under a default ' .
+        "process_control_timeout — the SIGQUIT/SIGTERM handler is what closes\n" .
+        $session->log());
+    if (count($containers) !== count($pids)) {
+        return;
+    }
+
+    // A written-but-empty container would satisfy a bare file count, so the
+    // spans are read back through the canonical decoder as well.
+    $seen = [];
+    $urlCounts = [];
+    foreach ($containers as $container) {
+        $spans = ct_web_spans($container);
+        ct_check(count($spans) > 0,
+            "container $container holds spans");
+        ct_eq(range(1, count($spans)),
+            array_map(static fn(array $s): int => $s['span_id'], $spans),
+            "container $container: span ids are 1..N");
+        foreach ($spans as $i => $span) {
+            $context = basename(dirname($container)) . " span $i";
+            ct_assert_span_shape($span, $context);
+            $key = $container . '#' . $span['span_id'];
+            ct_check(!isset($seen[$key]), "$context: appears only once");
+            $seen[$key] = true;
+            $url = ct_span_meta($span, 'http.url');
+            $urlCounts[$url] = ($urlCounts[$url] ?? 0) + 1;
+        }
+    }
+
+    ct_eq($total, count($seen),
+        "every one of the $total requests survived the hostile shutdown");
+    $wantPerUrl = $total / count($urls);
+    foreach ($urls as $url) {
+        ct_eq((int) $wantPerUrl, $urlCounts[$url] ?? 0,
+            "URL $url appears $wantPerUrl times across the pool");
+    }
+}
+
+// ===========================================================================
 // php_interning_shared_across_requests
 // ===========================================================================
 
@@ -427,6 +543,7 @@ if (!is_executable(ct_web_extension_path())) {
 
 test_php_builtin_server_requests_land_in_one_container();
 test_php_fpm_multi_worker_requests_all_appear();
+test_php_fpm_default_control_timeout_still_writes_every_container();
 test_php_interning_shared_across_requests();
 
 echo "\n" . str_repeat('=', 64) . "\n";

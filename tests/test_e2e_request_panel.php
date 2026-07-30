@@ -1,5 +1,24 @@
 <?php
 /**
+ * SUPERSEDED BY RS-M7 — kept for history, run by no recipe.
+ *
+ * This file asserts the pre-RS-M7 shape: a `CODETRACER_SPAN_MANIFEST` JSONL
+ * sidecar, one line per request, each an object with `id` / `label` /
+ * `span_type` / `status` and a `metadata` MAP.  All of it is gone.  A worker
+ * now keeps ONE continuous recording and each request is a record in that
+ * container's own `spans.dat` stream, whose metadata is an ORDERED LIST of
+ * [key, value] pairs — order is part of the wire contract — with no sidecar
+ * anywhere and nothing written per request.
+ *
+ * The replacement is `tests/test_request_spans.php`, whose
+ * `ct_assert_span_shape()` asserts the same panel-facing contract (span_type,
+ * status, and the http.method / http.url / http.status_code /
+ * http.duration_ms metadata prefix) against spans decoded by the canonical
+ * Nim reader `ct_spans_json()` — the one `ct print -f http` uses — instead of
+ * against JSON this file wrote itself.  Deleting this file is left to RS-M11,
+ * which retires the sidecar compatibility shim across every recorder; until
+ * then it records the contract that shim has to keep.
+ *
  * E2E test verifying PHP recorder spans are compatible with
  * the CodeTracer HTTP Request Panel.
  *
