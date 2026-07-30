@@ -5,8 +5,10 @@
  * Uses register_tick_function for basic step tracking.
  * Full implementation will use a C extension hooking zend_execute_ex.
  *
- * This is a placeholder -- the span tracking (span.php) is the
- * primary deliverable for M10.
+ * This is a placeholder.  Request spans are produced by the C extension
+ * (`ext/codetracer_php.c`) and land in the container's own `spans.dat`
+ * stream; the pure-PHP `span.php` that used to write them to a JSONL sidecar
+ * was removed in RS-M12.
  */
 
 class CodeTracerRecorder {
