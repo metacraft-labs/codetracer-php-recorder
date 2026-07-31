@@ -16,7 +16,11 @@ on:
 
 jobs:
   composer-bundling:
-    runs-on: ubuntu-latest
+    # Self-hosted per ci-workflow-standards.md (no GitHub-hosted runners).
+    # Toolchains come from nixpkgs on the runner instead of apt / marketplace
+    # setup-* actions: the launcher's build.sh cross-compiles with `zig cc`,
+    # and the composer package build/smoke-test needs php + composer.
+    runs-on: eph-linux-x64
     name: composer bundling smoke-test
     steps:
       - name: Generate CI token
@@ -38,23 +42,11 @@ jobs:
           path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
 
-      - name: Install Nim
-        uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.4"
-
-      - name: Install musl-tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
       - name: Build launcher
+        # build.sh cross-compiles via `zig cc -target x86_64-linux-musl`, so
+        # nim + zig from nixpkgs replace the setup-nim action and apt musl-tools.
         working-directory: codetracer-launcher
-        run: bash ./build.sh --target linux-musl-x86_64 --out launcher
-
-      - name: Set up PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.3'
-          tools: composer
+        run: nix shell nixpkgs#nim nixpkgs#zig -c bash ./build.sh --target linux-musl-x86_64 --out launcher
 
       - name: Build bundled composer package
         working-directory: codetracer-launcher/packaging/composer
@@ -66,7 +58,7 @@ jobs:
           # The launcher's build_composer.php vendors this tree under
           # lib/Recorder/ inside the produced zip.
           CT_RECORDER_SRC: ${{ github.workspace }}/codetracer-php-recorder/src
-        run: php build_composer.php --out dist
+        run: nix shell nixpkgs#php -c php build_composer.php --out dist
 
       - name: Smoke-test the composer package
         working-directory: ${{ runner.temp }}
@@ -84,7 +76,10 @@ jobs:
             "require": { "metacraft-labs/codetracer": "0.1.0" }
           }
           EOF
-          composer install --no-progress --no-interaction
-          out=$(./vendor/bin/ct --version)
-          echo "$out"
-          echo "$out" | grep -qE "^ct [0-9]+\.[0-9]+"
+          nix shell nixpkgs#php nixpkgs#phpPackages.composer -c bash -c '
+            set -euo pipefail
+            composer install --no-progress --no-interaction
+            out=$(./vendor/bin/ct --version)
+            echo "$out"
+            echo "$out" | grep -qE "^ct [0-9]+\.[0-9]+"
+          '
