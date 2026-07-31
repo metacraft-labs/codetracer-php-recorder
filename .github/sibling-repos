@@ -1,0 +1,5 @@
+# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
+# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+# The PHP C extension links against the shared trace-writer FFI built from
+# codetracer-trace-format-nim (see ext/build.sh + flake.nix shellHook).
+codetracer-trace-format-nim

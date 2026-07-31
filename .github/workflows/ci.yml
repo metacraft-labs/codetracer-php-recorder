@@ -1,0 +1,109 @@
+name: CI
+
+# Re-plays the project's deterministic dev env on the runner.
+# See:
+#   https://github.com/metacraft-labs/metacraft-dev-guidelines/blob/latest/policies/ci-shared-dev-env.md
+#
+# All jobs run on Metacraft Labs self-hosted runner classes per
+# ci-workflow-standards.md § "All CI jobs run on ... self-hosted runner
+# classes; GitHub-hosted runners are not permitted".
+#
+# Coverage matrix is narrowed to Linux (eph-linux-x64, eph-linux-arm64): the
+# recorder is a PHP C extension that links a Linux `.so` (libcodetracer_
+# trace_writer.so) — macOS/Windows extension packaging is not yet supported.
+# Widen the matrix once those targets land.
+
+on:
+  push:
+    branches: [main, dev, stable]
+  pull_request:
+    branches: [main, dev, stable]
+
+jobs:
+  lint-and-test:
+    name: Lint and test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [eph-linux-x64, eph-linux-arm64]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup dev env
+        # setup-dev-env clones the siblings listed in .github/sibling-repos
+        # (codetracer-trace-format-nim) at the workspace-lock-pinned revision
+        # before materialising the nix env. The flake's shellHook then points
+        # TRACE_FORMAT_NIM_DIR at ../codetracer-trace-format-nim.
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        with:
+          env-flavor: nix
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+
+      - name: Build Nim trace writer shared library (sibling artifact)
+        # ext/build.sh links the C extension against
+        # $TRACE_FORMAT_NIM_DIR/libcodetracer_trace_writer.so and the
+        # checked-in header at include/codetracer_trace_writer.h. Build the
+        # SHARED lib (--app:lib) via the dev shell so nim/zstd come from the
+        # flake rather than an ad-hoc install.
+        # TODO: replace with `direnv exec ../codetracer-trace-format-nim
+        # just build-trace-writer-shared-lib` once the sibling ships that
+        # target -- per cross-repo-builds.md.
+        run: |
+          dev-exec bash -c '
+            set -euo pipefail
+            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
+            nimble install -y stew results
+            nim c --app:lib --mm:arc --noMain -d:release -p:src \
+              -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim
+          '
+
+      - name: Lint
+        run: dev-exec just lint
+
+      - name: Test
+        run: dev-exec just test
+
+      - name: Collect test artefacts on failure
+        if: failure()
+        run: |
+          mkdir -p ci-artifacts
+          # Built extension + any build logs.
+          cp -r ext ci-artifacts/ext 2>/dev/null || true
+          # Trace bundles the e2e/extension tests emit (see Justfile).
+          cp -r /tmp/codetracer_test_traces ci-artifacts/traces 2>/dev/null || true
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.runner }}
+          path: ci-artifacts/
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Mirror test logs to S3 (non-blocking)
+        if: failure()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        with:
+          path: ci-artifacts/
+          prefix: test-logs-${{ matrix.runner }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
