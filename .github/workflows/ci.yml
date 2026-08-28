@@ -43,7 +43,7 @@ jobs:
         # (codetracer-trace-format-nim) at the workspace-lock-pinned revision
         # before materialising the nix env. The flake's shellHook then points
         # TRACE_FORMAT_NIM_DIR at ../codetracer-trace-format-nim.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
@@ -98,7 +98,7 @@ jobs:
       - name: Mirror test logs to S3 (non-blocking)
         if: failure()
         continue-on-error: true
-        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@main
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
         with:
           path: ci-artifacts/
           prefix: test-logs-${{ matrix.runner }}/${{ github.run_id }}
