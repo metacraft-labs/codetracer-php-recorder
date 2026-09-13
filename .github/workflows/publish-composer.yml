@@ -36,7 +36,7 @@ jobs:
     # Self-hosted per ci-workflow-standards.md (no GitHub-hosted runners).
     # This job only validates composer.json and pings Packagist, so a single
     # Linux runner is sufficient.
-    runs-on: eph-linux-x64
+    runs-on: [self-hosted, linux, x64]
     environment: composer
     steps:
       - uses: actions/checkout@v4
