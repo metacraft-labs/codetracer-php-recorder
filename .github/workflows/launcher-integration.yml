@@ -20,7 +20,7 @@ jobs:
     # Toolchains come from nixpkgs on the runner instead of apt / marketplace
     # setup-* actions: the launcher's build.sh cross-compiles with `zig cc`,
     # and the composer package build/smoke-test needs php + composer.
-    runs-on: eph-linux-x64
+    runs-on: [self-hosted, linux, x64]
     name: composer bundling smoke-test
     steps:
       - name: Generate CI token
