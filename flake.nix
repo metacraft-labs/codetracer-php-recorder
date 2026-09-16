@@ -14,7 +14,7 @@
     # only exists so `nix flake check` can resolve the source for
     # derivations that need it.
     codetracer-trace-format-nim = {
-      url = "github:metacraft-labs/codetracer-trace-format-nim/main";
+      url = "github:metacraft-labs/codetracer-trace-format-nim/dev";
       flake = false;
     };
   };
