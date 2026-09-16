@@ -4,11 +4,12 @@ set -e
 # CodeTracer PHP extension links against the **Nim** trace writer FFI from
 # `codetracer-trace-format-nim`, NOT the Rust FFI from `codetracer-trace-format`.
 #
-# Why: only the Nim writer produces the canonical V4 multi-stream CTFS layout
+# Why: this extension drives the C ABI, and the Nim writer is what exports it.
+# Both writers now produce the same canonical multi-stream CTFS layout
 # (steps.dat / calls.dat / values.dat / paths.dat / meta.dat / etc.) that
-# `ct print --full` decodes directly.  The Rust CTFS writer still emits the
-# legacy `events.log` + `meta.json` + `paths.json` layout that ct-print can't
-# unify with the multi-stream readers.  See
+# `ct print --full` decodes directly — the Rust writer's legacy `events.log`
+# and its `meta.json` / `paths.json` sidecars have since been retired, so that
+# is no longer what separates them.  See
 # `metacraft-specs/policies/recorder-test-requirements.md` §1 for the strict
 # golden-snapshot requirement that drives this choice.
 #
