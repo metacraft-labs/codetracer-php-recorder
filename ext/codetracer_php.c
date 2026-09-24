@@ -1377,7 +1377,6 @@ PHP_MSHUTDOWN_FUNCTION(codetracer)
 /* Request initialization — open this request's span over the worker timeline */
 PHP_RINIT_FUNCTION(codetracer)
 {
-    const char *script;
     ct_debug("RINIT sapi=%s writer=%p owner=%d",
              sapi_module.name ? sapi_module.name : "?",
              (void *)trace_writer, ct_state ? (int)ct_state->owner_pid : -1);
@@ -1416,25 +1415,9 @@ PHP_RINIT_FUNCTION(codetracer)
     ct_state->requests_seen++;
     tracing_enabled = 1;
 
-    /* Register a synthetic <toplevel> Function + Call so the script's
-     * top-level execution surfaces as a regular call frame.  Without this,
-     * ct-print only shows internal function calls and hides the outermost
-     * frame — every per-program test that asserts on call counts ends up
-     * off-by-one.  This stays PER REQUEST: on a worker timeline each request
-     * gets its own outermost frame.
-     *
-     * The paired Return is emitted in RSHUTDOWN so call_exit ordering stays
-     * balanced. */
-    script = SG(request_info).path_translated;
-    if (!script) script = "php";
-    {
-        uintptr_t toplevel_fid = trace_writer_ensure_function_id(
-            trace_writer, "<toplevel>", script, 1);
-        trace_writer_register_call(trace_writer, toplevel_fid);
-    }
-
-    /* Open the span AFTER the toplevel call so `start_step` names the first
-     * step of this request's own frame. */
+    /* trace_writer_start opened the worker's sole <toplevel> frame.
+     * Requests are spans within that timeline, not additional roots. Keep
+     * the frame open across RSHUTDOWN; writer close finalizes it once. */
     ct_span_begin();
     if (ct_state->span_active) {
         const char *remote = ct_server_var("REMOTE_ADDR");
@@ -1449,9 +1432,6 @@ PHP_RINIT_FUNCTION(codetracer)
 PHP_RSHUTDOWN_FUNCTION(codetracer)
 {
     if (trace_writer && ct_state && ct_state->writer_ready) {
-        /* Pair the synthetic <toplevel> Call registered in RINIT with a
-         * Return so call_exit ordering stays balanced. */
-        trace_writer_register_return(trace_writer);
         ct_span_settle();
     }
     in_io_hook = 0;

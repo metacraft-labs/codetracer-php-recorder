@@ -22,3 +22,6 @@ ext/configure~
 ext/libtool
 ext/modules/
 ext/run-tests.php
+
+# Repro development environment artifacts
+.repro/
