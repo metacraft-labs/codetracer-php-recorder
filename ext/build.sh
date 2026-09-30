@@ -49,6 +49,13 @@ fi
 # "can we run a compiled program?" test can find the shared library.
 export LD_LIBRARY_PATH="$FFI_LIB_DIR:${LD_LIBRARY_PATH:-}"
 
+# phpize copies its support files (build/*, run-tests.php) out of the PHP
+# installation, which under Nix is the read-only store, so they land mode 0444.
+# Without write permission a later phpize cannot overwrite them and silently
+# keeps the previous PHP's copies (`cp: ... Permission denied`).
+[ -d build ] && chmod -R u+w build
+[ -f run-tests.php ] && chmod u+w run-tests.php
+
 # Run phpize and configure
 phpize
 ./configure --enable-codetracer \
