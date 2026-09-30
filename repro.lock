@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v2"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:cbf29ce484222325"
+variants = []
+packages = []
+deps = [{ name = "codetracer-php-recorder", path = ".", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-php-recorder", ref = "relock/committed-develop-set", revision = "1c28f497bedffe4a61e64f185cfa1b6d4f4c43e7", integrity = "git-sha1:1c28f497bedffe4a61e64f185cfa1b6d4f4c43e7", version = "", visibility = "public", participation = "", depends = "codetracer-trace-format-nim", tags = "" }, { name = "codetracer-trace-format-nim", path = "../codetracer-trace-format-nim", coord_kind = "vcs", url = "https://github.com/metacraft-labs/codetracer-trace-format-nim", ref = "dev", revision = "4b0dcadaab3c9b4179ba8e7fda90269d2fa1be65", integrity = "git-sha1:4b0dcadaab3c9b4179ba8e7fda90269d2fa1be65", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
