@@ -79,12 +79,14 @@
               phpWithDev
               phpWithDev.unwrapped.dev
 
-              # Nim toolchain — only needed if rebuilding the trace writer
-              # FFI from source.  Most contributors will pull the prebuilt
-              # libcodetracer_trace_writer.so from the sibling checkout
-              # (built via `nim c --app:lib ...` from
-              # codetracer-trace-format-nim).
+              # Nim toolchain for building the sibling
+              # codetracer-trace-format-nim artifacts the tests need:
+              # libcodetracer_trace_writer.so (`nimble buildSharedLib`) and
+              # ct-print (`nimble buildCtPrint`).  nimble fetches the
+              # writer's `stew` / `results` dependencies and runs those tasks,
+              # so the flags stay the ones the writer repo defines.
               nim
+              nimble
 
               # Build automation
               just

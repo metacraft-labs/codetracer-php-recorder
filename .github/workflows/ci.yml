@@ -61,22 +61,22 @@ jobs:
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
 
-      - name: Build Nim trace writer shared library (sibling artifact)
+      - name: Build Nim trace-format sibling artifacts
         # ext/build.sh links the C extension against
-        # $TRACE_FORMAT_NIM_DIR/libcodetracer_trace_writer.so and the
-        # checked-in header at include/codetracer_trace_writer.h. Build the
-        # SHARED lib (--app:lib) via the dev shell so nim/zstd come from the
-        # flake rather than an ad-hoc install.
-        # TODO: replace with `direnv exec ../codetracer-trace-format-nim
-        # just build-trace-writer-shared-lib` once the sibling ships that
-        # target -- per cross-repo-builds.md.
+        # $TRACE_FORMAT_NIM_DIR/libcodetracer_trace_writer.so, and
+        # tests/test_e2e.php decodes every recording with
+        # $TRACE_FORMAT_NIM_DIR/ct-print. Both are built by the writer repo's
+        # own nimble tasks, inside this repo's dev shell (nim/nimble/zstd come
+        # from the flake), so the compiler flags are the ones the writer
+        # defines -- `buildSharedLib` carries the --nimMainPrefix that the
+        # FFI's `codetracerTraceWriterNimMain` import requires.
         run: |
           dev-exec bash -c '
             set -euo pipefail
             cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
             nimble install -y stew results
-            nim c --app:lib --mm:arc --noMain -d:release -p:src \
-              -o:libcodetracer_trace_writer.so src/codetracer_trace_writer_ffi.nim
+            nimble buildSharedLib
+            nimble buildCtPrint
           '
 
       - name: Lint
