@@ -8,6 +8,8 @@
 #include "SAPI.h"
 #include "php_codetracer.h"
 #include "Zend/zend_signal.h"
+#include "Zend/zend_exceptions.h"
+#include "Zend/zend_vm_opcodes.h"
 #include "codetracer_trace_writer.h"
 
 #include <stdio.h>
@@ -29,6 +31,9 @@ static int tracing_enabled = 0;
 static int in_trace_hook = 0;  /* Prevent recursive tracing */
 static int in_io_hook = 0;     /* Prevent recursive IO capture */
 static char *output_dir = NULL;
+static user_opcode_handler_t original_opcode_handlers[256];
+static unsigned char opcode_handler_installed[256];
+static void (*original_exception_hook)(zend_object *exception);
 
 /* ==========================================================================
  * RS-M7 — one continuous recording per WORKER, partitioned by request spans.
@@ -404,6 +409,67 @@ static size_t codetracer_sapi_ub_write(const char *str, size_t str_length)
         return original_sapi_ub_write(str, str_length);
     }
     return str_length;
+}
+
+/* Observe actual user-code execution before dispatching the original opcode.
+ * Locals describe the completed preceding opcode; no suspended generator frame
+ * is inspected outside this callback. PHP owns every borrowed zval throughout
+ * serialization, and the recorder never alters or consumes those values. */
+static int codetracer_opcode(zend_execute_data *execute_data)
+{
+    const zend_op *opline = execute_data->opline;
+    uint8_t opcode = opline->opcode;
+    if (tracing_enabled && !in_trace_hook && trace_writer && execute_data->func &&
+        execute_data->func->type == ZEND_USER_FUNCTION &&
+        execute_data->func->op_array.filename && opline->lineno > 0) {
+        zend_op_array *op_array = &execute_data->func->op_array;
+        in_trace_hook = 1;
+        trace_writer_register_step(trace_writer, ZSTR_VAL(op_array->filename),
+                                   (int64_t)opline->lineno);
+        for (int i = 0; i < op_array->last_var; i++) {
+            /* CV table indices are frame-slot indices, not the byte offsets
+             * accepted by zend_get_compiled_variable_value. PHP's public
+             * indexed frame macro applies the frame-slot displacement. */
+            zval *value = ZEND_CALL_VAR_NUM(execute_data, i);
+            if (value && Z_TYPE_P(value) != IS_UNDEF) {
+                serialize_zval(trace_writer, ZSTR_VAL(op_array->vars[i]), value);
+            }
+        }
+        if (opcode == ZEND_YIELD && opline->op1_type != IS_UNUSED) {
+            zval *value = zend_get_zval_ptr(opline, opline->op1_type,
+                                           &opline->op1, execute_data);
+            if (value && Z_TYPE_P(value) != IS_UNDEF) {
+                serialize_zval(trace_writer, "<yield>", value);
+            }
+            if (opline->op2_type != IS_UNUSED) {
+                zval *key = zend_get_zval_ptr(opline, opline->op2_type,
+                                             &opline->op2, execute_data);
+                if (key && Z_TYPE_P(key) != IS_UNDEF) {
+                    serialize_zval(trace_writer, "<yield_key>", key);
+                }
+            }
+        }
+        in_trace_hook = 0;
+    }
+    return original_opcode_handlers[opcode]
+        ? original_opcode_handlers[opcode](execute_data)
+        : ZEND_USER_OPCODE_DISPATCH;
+}
+
+static void codetracer_exception(zend_object *exception)
+{
+    if (tracing_enabled && !in_trace_hook && trace_writer && exception) {
+        zval temporary;
+        in_trace_hook = 1;
+        zval *message = zend_read_property(exception->ce, exception,
+                                          "message", sizeof("message") - 1,
+                                          true, &temporary);
+        trace_writer_register_special_event(trace_writer, ELK_ERROR,
+            ZSTR_VAL(exception->ce->name),
+            message && Z_TYPE_P(message) == IS_STRING ? Z_STRVAL_P(message) : "");
+        in_trace_hook = 0;
+    }
+    if (original_exception_hook) original_exception_hook(exception);
 }
 
 /* Our execute_ex hook */
@@ -1313,6 +1379,13 @@ PHP_MINIT_FUNCTION(codetracer)
     /* Save and replace zend_execute_ex */
     original_zend_execute_ex = zend_execute_ex;
     zend_execute_ex = codetracer_execute_ex;
+    for (unsigned int opcode = 0; opcode <= ZEND_VM_LAST_OPCODE; opcode++) {
+        original_opcode_handlers[opcode] = zend_get_user_opcode_handler((uint8_t)opcode);
+        opcode_handler_installed[opcode] =
+            zend_set_user_opcode_handler((uint8_t)opcode, codetracer_opcode) == SUCCESS;
+    }
+    original_exception_hook = zend_throw_exception_hook;
+    zend_throw_exception_hook = codetracer_exception;
 
     /* The recording state is PERSISTENT (`pemalloc(..., 1)`): it outlives
      * every request the worker serves, which is precisely the lifetime change
@@ -1371,6 +1444,12 @@ PHP_MSHUTDOWN_FUNCTION(codetracer)
 
     /* Restore original handler */
     zend_execute_ex = original_zend_execute_ex;
+    for (unsigned int opcode = 0; opcode <= ZEND_VM_LAST_OPCODE; opcode++) {
+        if (opcode_handler_installed[opcode]) {
+            zend_set_user_opcode_handler((uint8_t)opcode, original_opcode_handlers[opcode]);
+        }
+    }
+    zend_throw_exception_hook = original_exception_hook;
     return SUCCESS;
 }
 
