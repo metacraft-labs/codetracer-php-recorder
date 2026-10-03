@@ -302,15 +302,18 @@ function ct_translate_to_legacy(array $doc): array {
                 ]];
                 break;
             case 'io':
-                // Legacy `Event.kind` was a numeric EventLogKind
-                // discriminant: 0=Write (stdout), 1=WriteOther
-                // (stderr).  `metadata` carried the stream name
-                // ("stdout"/"stderr").
-                $isStdout = ($e['io_kind'] ?? '') === 'ioStdout';
-                $isError = ($e['io_kind'] ?? '') === 'ioError';
+                // Preserve canonical EventLogKind ordinals and actual metadata.
+                $eventKinds = ['Write' => 0, 'WriteFile' => 1, 'WriteOther' => 2,
+                    'Read' => 3, 'ReadFile' => 4, 'ReadOther' => 5, 'ReadDir' => 6,
+                    'OpenDir' => 7, 'CloseDir' => 8, 'Socket' => 9, 'Open' => 10,
+                    'Error' => 11, 'TraceLogEvent' => 12, 'EvmEvent' => 13];
+                $kindName = $e['io_kind'] ?? '';
+                if (!array_key_exists($kindName, $eventKinds)) {
+                    throw new UnexpectedValueException("unassigned EventLogKind: $kindName");
+                }
                 $out[] = ['Event' => [
-                    'kind' => $isError ? 11 : ($isStdout ? 0 : 1),
-                    'metadata' => $isError ? ($e['metadata'] ?? '') : ($isStdout ? 'stdout' : 'stderr'),
+                    'kind' => $eventKinds[$kindName],
+                    'metadata' => $e['metadata'] ?? '',
                     'content' => $e['text'] ?? '',
                 ]];
                 break;
@@ -922,6 +925,18 @@ foreach (['generators' => [7, 0, 1, 1], 'exceptions' => [0, 5, 1, 1]] as $fixtur
             ? array_map('intval', preg_split('/\s+/', trim(file_get_contents($report)))) : [];
         ct_assert_eq($expectedReport, $observedReport,
             "prior handler $fixture $mode: exact callback counts and shutdown restoration");
+    }
+}
+
+// Exercise the real projection with deliberately invalid discriminants.
+// This pure-schema negative control mocks no recorder or PHP runtime.
+foreach (['unassigned' => ['io_kind' => 'NotAnEventKind'],
+          'missing' => [], 'retired' => ['io_kind' => 'ioStdout']] as $case => $fields) {
+    try {
+        ct_translate_to_legacy(['events' => [array_merge(['kind' => 'io'], $fields)]]);
+        ct_fail("EventLogKind $case discriminant rejected", 'projection accepted invalid schema');
+    } catch (UnexpectedValueException $error) {
+        ct_pass("EventLogKind $case discriminant rejected");
     }
 }
 
