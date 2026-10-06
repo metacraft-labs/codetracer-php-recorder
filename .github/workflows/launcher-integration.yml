@@ -51,6 +51,14 @@ jobs:
           path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
 
+      # `[self-hosted, linux, x64]` also matches garm-* ephemeral runners,
+      # whose job PATH carries no `nix` until it is provisioned ("nix: command
+      # not found" on every leg that landed there). The shared setup-nix
+      # action makes the `nix shell` below work on every runner class.
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          trusted-public-keys: ${{ vars.ATTIC_TRUSTED_PUBLIC_KEY }}
+          substituters: ${{ vars.ATTIC_SUBSTITUTER }}
       - name: Build launcher
         # build.sh cross-compiles via `zig cc -target x86_64-linux-musl`, so
         # nim + zig from nixpkgs replace the setup-nim action and apt musl-tools.
