@@ -51,6 +51,12 @@ jobs:
           path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
 
+      - name: Provision declared Nix build runtime
+        uses: metacraft-labs/metacraft-github-actions/setup-nix@3fcbb26dd920adf6ccc64a87c6d24797ab0b5d94
+        with:
+          gh-token: ${{ steps.app-token.outputs.token }}
+          token-owner: metacraft-labs
+
       - name: Build launcher
         # build.sh cross-compiles via `zig cc -target x86_64-linux-musl`, so
         # nim + zig from nixpkgs replace the setup-nim action and apt musl-tools.
