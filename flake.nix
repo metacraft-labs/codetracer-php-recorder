@@ -69,6 +69,30 @@
               all.opcache
             ]
           );
+          # git-hooks.nix installs `.pre-commit-config.yaml` and git hooks into
+          # `git rev-parse --show-toplevel` of the directory the shell is entered
+          # from, so `nix develop /path/to/this-repo` run inside another checkout
+          # would plant this repository's hooks there. `ownRepoOnly` runs a snippet
+          # only when that toplevel is this repository, recognised by a `flake.nix`
+          # identical to the one this shell was evaluated from; anything it cannot
+          # establish counts as another repository, so it fails safe.
+          # tests/test_dev_shell_writes_nothing_elsewhere.sh
+          ownRepoOnly = script: ''
+            _own_repo_root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
+            if [ -n "$_own_repo_root" ] && [ -f "$_own_repo_root/flake.nix" ] \
+              && [ "$(${pkgs.coreutils}/bin/sha256sum "$_own_repo_root/flake.nix" | ${pkgs.coreutils}/bin/cut -d' ' -f1)" \
+                = "${builtins.hashFile "sha256" ./flake.nix}" ]; then
+            ${script}
+            # git-hooks.nix's installer leaves core.hooksPath as the RELATIVE
+            # `.git/hooks`, in the config every worktree shares. A linked worktree
+            # cannot resolve it (there `.git` is a file), so git silently runs no
+            # hooks there. Point it at the common hooks directory instead.
+            if [ "$(${pkgs.git}/bin/git config --local --get core.hooksPath 2>/dev/null)" = .git/hooks ]; then
+              ${pkgs.git}/bin/git config --local core.hooksPath "$(${pkgs.git}/bin/git rev-parse --path-format=absolute --git-common-dir)/hooks"
+            fi
+            fi
+            unset _own_repo_root
+          '';
         in
         {
           default = pkgs.mkShell {
@@ -107,7 +131,7 @@
             # Override with TRACE_FORMAT_NIM_DIR when working off a different
             # path.
             shellHook = ''
-              ${preCommit.shellHook}
+              ${ownRepoOnly preCommit.shellHook}
               if [ -z "''${TRACE_FORMAT_NIM_DIR:-}" ] && [ -d "$PWD/../codetracer-trace-format-nim" ]; then
                 export TRACE_FORMAT_NIM_DIR="$PWD/../codetracer-trace-format-nim"
               fi

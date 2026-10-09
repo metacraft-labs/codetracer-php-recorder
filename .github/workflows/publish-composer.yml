@@ -7,7 +7,7 @@ name: publish-composer
 # becomes visible without waiting for the next periodic crawl.
 #
 # Fires on `v*` tag pushes (the primary release path) and also
-# accepts a manual workflow_dispatch (per Repo-Requirements.md §2.8.4).
+# accepts a manual workflow_dispatch (per Repo-Requirements.md §2.5.4).
 #
 # Required secrets:
 #   COMPOSER_PACKAGIST_TOKEN   Packagist API token for the

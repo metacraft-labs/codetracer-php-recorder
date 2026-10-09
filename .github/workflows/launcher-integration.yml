@@ -13,6 +13,7 @@ on:
   push:
     branches: [main, dev, stable]
   pull_request:
+    branches-ignore: [agents]
 
 # Cancel superseded PR runs only: a new push to a PR makes its previous run
 # moot, and stale runs otherwise hold scarce self-hosted runners. Every other
@@ -49,6 +50,12 @@ jobs:
           ref: dev
           path: codetracer-launcher
           gh-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Provision declared Nix build runtime
+        uses: metacraft-labs/metacraft-github-actions/setup-nix@3fcbb26dd920adf6ccc64a87c6d24797ab0b5d94
+        with:
+          gh-token: ${{ steps.app-token.outputs.token }}
+          token-owner: metacraft-labs
 
       - name: Build launcher
         # build.sh cross-compiles via `zig cc -target x86_64-linux-musl`, so

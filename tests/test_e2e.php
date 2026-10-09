@@ -281,6 +281,17 @@ function ct_translate_to_legacy(array $doc): array {
                     'depth' => $e['depth'] ?? 0,
                     'step_index' => $e['step_index'] ?? null,
                 ]];
+                // --full embeds scoped values in each step's vars array.
+                // Preserve every actual decoded value in the legacy projection
+                // instead of dropping the properties these assertions test.
+                foreach ($e['vars'] ?? [] as $variable) {
+                    $out[] = ['Value' => [
+                        'variable_id' => $variable['varname_id'],
+                        'varname' => $variable['varname'],
+                        'value' => $variable['value'],
+                        'type_id' => $variable['type_id'],
+                    ]];
+                }
                 break;
             case 'value':
                 $out[] = ['Value' => [
@@ -291,15 +302,31 @@ function ct_translate_to_legacy(array $doc): array {
                 ]];
                 break;
             case 'io':
-                // Legacy `Event.kind` was a numeric EventLogKind
-                // discriminant: 0=Write (stdout), 1=WriteOther
-                // (stderr).  `metadata` carried the stream name
-                // ("stdout"/"stderr").
-                $isStdout = ($e['io_kind'] ?? '') === 'ioStdout';
+                // Preserve the canonical EventLogKind ordinal and the
+                // independently recorded metadata, without stream inference.
+                $eventKinds = [
+                    'Write' => 0, 'WriteFile' => 1, 'WriteOther' => 2,
+                    'Read' => 3, 'ReadFile' => 4, 'ReadOther' => 5,
+                    'ReadDir' => 6, 'OpenDir' => 7, 'CloseDir' => 8,
+                    'Socket' => 9, 'Open' => 10, 'Error' => 11,
+                    'TraceLogEvent' => 12, 'EvmEvent' => 13,
+                ];
+                if (!isset($e['io_kind']) || !is_string($e['io_kind'])) {
+                    throw new UnexpectedValueException('canonical EventLogKind must be a present string');
+                }
+                if (!array_key_exists($e['io_kind'], $eventKinds)) {
+                    throw new UnexpectedValueException('unassigned canonical EventLogKind: [' . $e['io_kind'] . ']');
+                }
+                // The canonical CLI omits metadata only for zero-length bytes.
+                // Present null/nonstring metadata remains malformed.
+                $metadata = array_key_exists('metadata', $e) ? $e['metadata'] : '';
+                if (!isset($e['text']) || !is_string($e['text']) || !is_string($metadata)) {
+                    throw new RuntimeException('canonical IO text and present metadata must be strings');
+                }
                 $out[] = ['Event' => [
-                    'kind' => $isStdout ? 0 : 1,
-                    'metadata' => $isStdout ? 'stdout' : 'stderr',
-                    'content' => $e['text'] ?? '',
+                    'kind' => $eventKinds[$e['io_kind']],
+                    'metadata' => $metadata,
+                    'content' => $e['text'],
                 ]];
                 break;
         }
@@ -402,16 +429,8 @@ $programs_dir = __DIR__ . '/programs';
 // The recorder MUST surface these five (name, i64) pairs as step
 // variable values.
 //
-// RECORDER BUG: per-statement step granularity.  The PHP extension's
-// `zend_execute_ex` hook fires once per function entry (at
-// `op_array.line_start`) — it does NOT install a `zend_observer`
-// per-opcode trampoline, so the per-let-binding values inside
-// `compute()` are never emitted as scoped variables.  See
-// `AUDIT-CTFS-2026-05.md` open gap "Per-opcode step granularity".
-// Until the recorder grows opcode-level observation, the canonical
-// flow_test variable assertion CANNOT pass; we pin the present-day
-// shape (Return value of 94 from `compute`) and provide a sibling
-// SKIP test capturing the spec-correct expectation.
+// Real PHP user-opcode observation captures locals during execution. The
+// independent arithmetic oracle below checks all five canonical values.
 // =========================================================================
 
 echo "\n==> flow_test.php (canonical §4 fixture)\n";
@@ -429,7 +448,11 @@ $proj = ct_project($events);
 ct_assert_eq(1, count($proj['Path'] ?? []), 'flow_test: 1 path registered');
 ct_assert_eq(2, count($proj['Function'] ?? []), 'flow_test: 2 functions registered (<toplevel>, compute)');
 ct_assert_eq(2, count($proj['Call'] ?? []), 'flow_test: 2 calls (<toplevel>, compute)');
-ct_assert_eq(2, count($proj['Step'] ?? []), 'flow_test: 2 step events (call entry + post-return)');
+// The pinned PHP compiler independently disassembles this program into eight
+// executed main opcodes and ten executed compute opcodes (the final two
+// compute instructions are unreachable), plus the two existing call-entry
+// steps. These counts describe the program, not the recorder's output.
+ct_assert_eq(20, count($proj['Step'] ?? []), 'flow_test: 18 executed opcode steps + 2 call-entry steps');
 ct_assert_eq(1, count($proj['Return'] ?? []), 'flow_test: 1 return (compute) -- <toplevel> has no Return');
 ct_assert_eq(1, count($proj['Event'] ?? []), 'flow_test: 1 io event (the echo)');
 
@@ -456,16 +479,17 @@ ct_assert_eq(0, $ioev['kind'], 'flow_test: io_event kind = ELK_WRITE (0)');
 ct_assert_eq('stdout', $ioev['metadata'], 'flow_test: io_event metadata = stdout');
 ct_assert_eq("flow_test result: 94\n", $ioev['content'], 'flow_test: io_event content');
 
-// SKIP: per-let-binding variable values (a=10, b=32, sum_val=42, doubled=84, final_result=94).
-// RECORDER BUG: per-statement step granularity is not implemented;
-// see file-level note above.  The recorder only emits `Step` at
-// function entry, so the let-bindings inside compute() never surface
-// as scoped variables.  Tracking issue: extend `codetracer_php.c`
-// `codetracer_execute_ex` to register a `zend_observer_fcall_init`
-// hook for per-opcode step capture (PHP 8.0+ observer API).
-ct_skip('flow_test: canonical (a,b,sum_val,doubled,final_result) variables surface',
-    'RECORDER BUG: PHP recorder lacks per-statement step granularity. ' .
-    'Tracked in AUDIT-CTFS-2026-05.md "Per-opcode step granularity".');
+$expectedFlowValues = ['a' => 10, 'b' => 32, 'sum_val' => 42, 'doubled' => 84, 'final_result' => 94];
+foreach ($expectedFlowValues as $name => $expected) {
+    $observed = [];
+    foreach ($proj['Value'] ?? [] as $value) {
+        if (($value['varname'] ?? '') === $name) {
+            $observed[] = ct_assert_value_int_kind($value['value'], "flow_test: $name");
+        }
+    }
+    ct_assert_eq([$expected], array_values(array_unique($observed)),
+        "flow_test: canonical $name value");
+}
 
 // =========================================================================
 // nested_calls.php — 4-deep chain + recursive factorial.
@@ -698,12 +722,11 @@ ct_assert_eq('finally1->caught:app-failure',
     ct_assert_value_raw_kind($rets[7]['return_value'], 'with_finally'),
     'exceptions: with_finally returns "finally1->caught:app-failure"');
 
-// SKIP: ELK_ERROR special-event for thrown exceptions.
-ct_skip('exceptions: thrown exceptions surface as ELK_ERROR special event',
-    'RECORDER BUG: zend_throw_exception_internal is not hooked. ' .
-    'Spec (§2): raise-with-handler MUST produce a RecordEvent of EventKindError. ' .
-    'Tracking: add an ELK_ERROR call in the throw-hook path, mirroring ' .
-    'cardano test_tracer.rs::test_error_paths_test_emits_fail_event.');
+$errors = array_values(array_filter($proj['Event'] ?? [], fn($event) => $event['kind'] === 11));
+ct_assert_eq(['AppError', 'NetworkError', 'FormatError', 'AppError', 'AppError'],
+    array_column($errors, 'metadata'), 'exceptions: five real throws including rethrow, exact classes');
+ct_assert_eq(['app-failure', 'net-failure', 'fmt-failure', 'app-failure', 'app-failure'],
+    array_column($errors, 'content'), 'exceptions: exact decoded throw messages');
 
 // Verify that the unhandled-throw branch terminates the program with
 // non-zero exit + the exception message on stderr.  This exercises
@@ -740,6 +763,12 @@ ct_assert_true(str_contains($combined, 'unhandled'),
 $cts2 = glob($traceDir2 . '/*.ct');
 ct_assert_true(!empty($cts2),
     'exceptions: --terminate still produced a .ct CTFS bundle (recorder runs to RSHUTDOWN)');
+$terminatingEvents = ct_project(ct_decode_events($traceDir2));
+$terminatingErrors = array_values(array_filter($terminatingEvents['Event'] ?? [], fn($event) => $event['kind'] === 11));
+ct_assert_eq(['AppError', 'NetworkError', 'FormatError', 'AppError', 'AppError', 'RuntimeException'],
+    array_column($terminatingErrors, 'metadata'), 'exceptions: handled and terminating throw classes');
+ct_assert_eq(['app-failure', 'net-failure', 'fmt-failure', 'app-failure', 'app-failure', 'unhandled'],
+    array_column($terminatingErrors, 'content'), 'exceptions: handled and terminating decoded messages');
 
 // =========================================================================
 // closures.php — Closure::bind, arrow functions, value vs ref captures.
@@ -835,18 +864,94 @@ ct_assert_eq("range=1,2,3,4,ret=4\n", $proj['Event'][0]['content'],
 ct_assert_eq("keyed=a=1,b=2,c=3\n", $proj['Event'][1]['content'],
     'generators: keyed echo content');
 
-// SKIP: yielded value sequence (1, 2, 3, 4 from int_range and
-// "a"=>1, "b"=>2, "c"=>3 from keyed) should surface as a sequence
-// of step-variable values OR a dedicated yield event.
-ct_skip('generators: yielded values surface as step variables / yield events',
-    'RECORDER BUG: PHP recorder does not specialise zend_generator ' .
-    'resumption; yielded values are not captured because the per-statement ' .
-    'step granularity is missing (same root cause as flow_test).  ' .
-    'Tracking: combine the per-opcode step hook with a generator-aware ' .
-    'capture path, mirroring the python recorder yield-event handling ' .
-    '(handoff entry 1.27).');
+$yieldedValues = [];
+$yieldedKeys = [];
+foreach ($proj['Value'] ?? [] as $value) {
+    if (($value['varname'] ?? '') === '<yield>') {
+        $yieldedValues[] = ct_assert_value_int_kind($value['value'], 'generators: yield');
+    } elseif (($value['varname'] ?? '') === '<yield_key>') {
+        $yieldedKeys[] = ct_assert_value_raw_kind($value['value'], 'generators: yield key');
+    }
+}
+ct_assert_eq([1, 2, 3, 4, 1, 2, 3], $yieldedValues, 'generators: exact real yielded value sequence');
+ct_assert_eq(['a', 'b', 'c'], $yieldedKeys, 'generators: exact explicit yielded keys');
+
+// Negative recording control uses the same real extension/runtime entry point.
+// No mocks: filesystem output and the actual PHP arithmetic result are checked.
+$disabledDir = sys_get_temp_dir() . '/ct_php_disabled_' . bin2hex(random_bytes(6));
+mkdir($disabledDir, 0755, true);
+$disabledEnv = $env2;
+$disabledEnv['CODETRACER_ENABLED'] = '0';
+$disabledEnv['CODETRACER_TRACE_DIR'] = $disabledDir;
+$disabledProc = proc_open([
+    'php', '-d', 'extension=' . ct_extension_path(), $programs_dir . '/flow_test.php',
+], $descs, $disabledPipes, ct_repo_root(), $disabledEnv);
+if (!is_resource($disabledProc)) throw new RuntimeException('failed to spawn disabled recording control');
+fclose($disabledPipes[0]);
+$disabledStdout = stream_get_contents($disabledPipes[1]); fclose($disabledPipes[1]);
+$disabledStderr = stream_get_contents($disabledPipes[2]); fclose($disabledPipes[2]);
+ct_assert_eq(0, proc_close($disabledProc), 'disabled recording: normal PHP exit');
+ct_assert_eq("flow_test result: 94\n", $disabledStdout, 'disabled recording: arithmetic output unchanged');
+ct_assert_eq('', $disabledStderr, 'disabled recording: no runtime diagnostics');
+ct_assert_eq([], glob($disabledDir . '/*.ct'), 'disabled recording: no container produced');
 
 // ---------------------------------------------------------------------------
+// Genuine prior extension callbacks: execution, chaining, and shutdown restore.
+// The helper is a real compiled PHP extension (see its boundary justification),
+// loaded before CodeTracer. Its own MSHUTDOWN observes restoration after the
+// recorder has shut down. The no-recorder control independently proves that the
+// probe itself observes the pinned interpreter's genuine callback lifecycle.
+function ct_boundary_run(array $command, array $environment): array {
+    $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes, ct_repo_root(), $environment);
+    if (!is_resource($process)) throw new RuntimeException('cannot start boundary probe');
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]); fclose($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    return [proc_close($process), $stdout, $stderr];
+}
+$probeDir = sys_get_temp_dir() . '/ct_php_handler_' . bin2hex(random_bytes(6));
+mkdir($probeDir, 0755, true);
+$probeEnv = $env2;
+[$includesStatus, $includes, $includesError] = ct_boundary_run(['php-config', '--includes'], $probeEnv);
+ct_assert_eq(0, $includesStatus, 'prior handler probe: pinned PHP include discovery');
+$probeLibrary = $probeDir . '/handler_chain_probe.so';
+[$compileStatus, , $compileError] = ct_boundary_run(array_merge(
+    ['cc', '-shared', '-fPIC'], preg_split('/\s+/', trim($includes)),
+    ['tests/handler_chain_probe.c', '-o', $probeLibrary]), $probeEnv);
+ct_assert_eq(0, $compileStatus, 'prior handler probe: real extension compilation');
+if ($compileStatus !== 0) throw new RuntimeException($compileError);
+foreach (['generators' => [7, 0, 1, 1], 'exceptions' => [0, 5, 1, 1]] as $fixture => $expectedReport) {
+    foreach ([false, true] as $withRecorder) {
+        $mode = $withRecorder ? 'with recorder' : 'independent control';
+        $report = $probeDir . '/' . $fixture . ($withRecorder ? '_recorder' : '_control');
+        $probeEnv['CT_HANDLER_PROBE_REPORT'] = $report;
+        $probeEnv['CODETRACER_TRACE_DIR'] = $probeDir . '/traces_' . basename($report);
+        $command = ['php', '-d', 'extension=' . $probeLibrary];
+        if ($withRecorder) array_push($command, '-d', 'extension=' . ct_extension_path());
+        $command[] = $programs_dir . '/' . $fixture . '.php';
+        [$status, $output, $errors] = ct_boundary_run($command, $probeEnv);
+        ct_assert_eq(0, $status, "prior handler $fixture $mode: real PHP exit");
+        ct_assert_eq('', $errors, "prior handler $fixture $mode: no runtime diagnostics");
+        $observedReport = is_file($report)
+            ? array_map('intval', preg_split('/\s+/', trim(file_get_contents($report)))) : [];
+        ct_assert_eq($expectedReport, $observedReport,
+            "prior handler $fixture $mode: exact callback counts and shutdown restoration");
+    }
+}
+
+// Exercise the real projection with deliberately invalid discriminants.
+// This pure-schema negative control mocks no recorder or PHP runtime.
+foreach (['unassigned' => ['io_kind' => 'NotAnEventKind'],
+          'missing' => [], 'retired' => ['io_kind' => 'ioStdout']] as $case => $fields) {
+    try {
+        ct_translate_to_legacy(['events' => [array_merge(['kind' => 'io'], $fields)]]);
+        ct_fail("EventLogKind $case discriminant rejected", 'projection accepted invalid schema');
+    } catch (UnexpectedValueException $error) {
+        ct_pass("EventLogKind $case discriminant rejected");
+    }
+}
+
 // Summary
 // ---------------------------------------------------------------------------
 

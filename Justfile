@@ -174,7 +174,7 @@ record-request-panel-fixture OUT:
     echo "[fixture] wrote {{OUT}}/app.ct"
 
 # --- M13: Packaging UX Standardization ---
-# Implements Repo-Requirements.md §2.8 packaging UX for the PHP
+# Implements Repo-Requirements.md §2.5 packaging UX for the PHP
 # language-ecosystem recorder. Single channel: composer.
 
 # Bump the version. PHP composer packages tend to lean on git tags as
@@ -255,3 +255,8 @@ build-composer:
 
 verify-composer:
     just verify-package composer
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh
