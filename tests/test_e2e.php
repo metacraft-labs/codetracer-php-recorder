@@ -208,6 +208,27 @@ function ct_decode_events(string $traceDir): array {
 }
 
 /**
+ * EventLogKind name -> ordinal, as `codetracer-trace-format-spec`
+ * `trace-events.md` §"EventLogKind (u8 enum)" assigns them.
+ */
+const CT_EVENT_LOG_KINDS = [
+    'Write' => 0,
+    'WriteFile' => 1,
+    'WriteOther' => 2,
+    'Read' => 3,
+    'ReadFile' => 4,
+    'ReadOther' => 5,
+    'ReadDir' => 6,
+    'OpenDir' => 7,
+    'CloseDir' => 8,
+    'Socket' => 9,
+    'Open' => 10,
+    'Error' => 11,
+    'TraceLogEvent' => 12,
+    'EvmEvent' => 13,
+];
+
+/**
  * Map a ct-print --full document into the legacy projection shape
  * (`{Step:{...}}`, `{Call:{...}}`, `{Value:{...}}`, ...) so the
  * per-program assertions in this file don't need rewriting.
@@ -291,14 +312,20 @@ function ct_translate_to_legacy(array $doc): array {
                 ]];
                 break;
             case 'io':
-                // Legacy `Event.kind` was a numeric EventLogKind
-                // discriminant: 0=Write (stdout), 1=WriteOther
-                // (stderr).  `metadata` carried the stream name
-                // ("stdout"/"stderr").
-                $isStdout = ($e['io_kind'] ?? '') === 'ioStdout';
+                // `io_kind` is the EventLogKind name as `trace-events.md`
+                // §"EventLogKind (u8 enum)" spells it; the projection
+                // keeps the numeric ordinal that table assigns.
+                // `metadata` is the recorder's own stream label, stored
+                // verbatim in the container.
+                $ioKind = $e['io_kind'] ?? null;
+                if (!array_key_exists($ioKind, CT_EVENT_LOG_KINDS)) {
+                    throw new RuntimeException(
+                        'io event has an io_kind that is not an EventLogKind: ' .
+                        json_encode($ioKind));
+                }
                 $out[] = ['Event' => [
-                    'kind' => $isStdout ? 0 : 1,
-                    'metadata' => $isStdout ? 'stdout' : 'stderr',
+                    'kind' => CT_EVENT_LOG_KINDS[$ioKind],
+                    'metadata' => $e['metadata'] ?? null,
                     'content' => $e['text'] ?? '',
                 ]];
                 break;
