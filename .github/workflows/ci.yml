@@ -34,7 +34,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [eph-linux-x64, eph-linux-arm64]
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner == 'eph-linux-x64' && fromJSON('["self-hosted","linux","x64","ephemeral","incus"]') || matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
