@@ -248,10 +248,16 @@ function ct_translate_to_legacy(array $doc): array {
     foreach (($doc['types'] ?? []) as $i => $name) {
         $out[] = ['Type' => ['id' => $i, 'lang_type' => $name]];
     }
+    // Raise and Catch records carry no position of their own: the reader
+    // resolves them to the running position (the line of the last step)
+    // and to the innermost open call, which these two track.
+    $openCalls = [];
+    $lastStepLine = null;
     foreach (($doc['events'] ?? []) as $e) {
         $k = $e['kind'] ?? null;
         switch ($k) {
             case 'call_entry':
+                $openCalls[] = $e['function'] ?? null;
                 $out[] = ['Call' => [
                     'call_key' => $e['call_key'] ?? null,
                     'function_id' => $e['function_id'],
@@ -262,6 +268,7 @@ function ct_translate_to_legacy(array $doc): array {
                 ]];
                 break;
             case 'call_exit':
+                array_pop($openCalls);
                 // Synthetic <toplevel> never emits a Return event —
                 // matches the legacy projection convention.
                 $isToplevel = ($e['depth'] ?? 0) === 0
@@ -288,37 +295,34 @@ function ct_translate_to_legacy(array $doc): array {
                     ]];
                 }
                 break;
-            case 'step':
+            case 'raise':
                 // Raise and Catch are exec records but not steps
                 // (`trace-events.md` §"Which exec records are steps"), so
                 // they get their own projection kinds and never count as
-                // a Step.  They carry no position of their own: the
-                // reader resolves them to the running position, i.e. the
-                // step before them, and to the innermost open call.
+                // a Step.
+                $out[] = ['Raise' => [
+                    'type' => $types[$e['exception_type_id']] ?? null,
+                    'message' => $e['exception_message'] ?? null,
+                    'function' => end($openCalls) ?: null,
+                    'line' => $lastStepLine,
+                    'step_index' => $e['step_index'] ?? null,
+                ]];
+                break;
+            case 'catch':
+                $out[] = ['Catch' => [
+                    'type' => $types[$e['exception_type_id']] ?? null,
+                    'function' => end($openCalls) ?: null,
+                    'step_index' => $e['step_index'] ?? null,
+                ]];
+                break;
+            case 'step':
                 $stepKind = $e['step_kind'] ?? 'sekAbsoluteStep';
-                if ($stepKind === 'sekRaise') {
-                    $out[] = ['Raise' => [
-                        'type' => $types[$e['exception_type_id']] ?? null,
-                        'message' => $e['exception_message'] ?? null,
-                        'function' => $e['function'] ?? null,
-                        'line' => $e['line'] ?? null,
-                        'step_index' => $e['step_index'] ?? null,
-                    ]];
-                    break;
-                }
-                if ($stepKind === 'sekCatch') {
-                    $out[] = ['Catch' => [
-                        'type' => $types[$e['catch_exception_type_id']] ?? null,
-                        'function' => $e['function'] ?? null,
-                        'step_index' => $e['step_index'] ?? null,
-                    ]];
-                    break;
-                }
                 if ($stepKind !== 'sekAbsoluteStep' && $stepKind !== 'sekDeltaStep') {
                     throw new RuntimeException(
                         'unexpected exec record kind ' . json_encode($stepKind) .
                         '; extend the projection rather than folding it into Step');
                 }
+                $lastStepLine = $e['line'] ?? null;
                 $vars = [];
                 foreach (($e['vars'] ?? []) as $v) {
                     $vars[] = ['name' => $v['varname'] ?? null, 'value' => $v['value'] ?? null];
@@ -364,6 +368,12 @@ function ct_translate_to_legacy(array $doc): array {
                     'content' => $e['text'] ?? '',
                 ]];
                 break;
+            default:
+                // Thread records and any entry kind this projection does
+                // not model must surface, never vanish from the stream.
+                throw new RuntimeException(
+                    'unexpected ct-print event kind ' . json_encode($k) .
+                    '; extend the projection to cover it');
         }
     }
     return $out;
