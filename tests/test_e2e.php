@@ -34,360 +34,8 @@
 
 declare(strict_types=1);
 
-// ---------------------------------------------------------------------------
-// Test framework (tiny — we deliberately avoid pulling in PHPUnit).
-// ---------------------------------------------------------------------------
+require_once __DIR__ . '/lib/ct_harness.php';
 
-$GLOBALS['__ct_tests'] = 0;
-$GLOBALS['__ct_passed'] = 0;
-$GLOBALS['__ct_failed'] = 0;
-$GLOBALS['__ct_skipped'] = 0;
-$GLOBALS['__ct_failures'] = [];
-
-function ct_pass(string $name): void {
-    $GLOBALS['__ct_tests']++;
-    $GLOBALS['__ct_passed']++;
-    echo "  PASS: $name\n";
-}
-
-function ct_fail(string $name, string $why): void {
-    $GLOBALS['__ct_tests']++;
-    $GLOBALS['__ct_failed']++;
-    $GLOBALS['__ct_failures'][] = "$name -- $why";
-    echo "  FAIL: $name -- $why\n";
-}
-
-function ct_skip(string $name, string $why): void {
-    $GLOBALS['__ct_tests']++;
-    $GLOBALS['__ct_skipped']++;
-    // Per the recorder-test-requirements policy, every conditional
-    // skip MUST log a clear `SKIP:` diagnostic so that
-    // `verify-cli-convention-no-silent-skip.sh` can spot it and CI
-    // doesn't quietly degrade.  Do NOT remove the literal `SKIP:`
-    // token even when refactoring this helper.
-    echo "  SKIP: $name -- $why\n";
-}
-
-function ct_assert_eq($expected, $actual, string $name): void {
-    if ($expected === $actual) { ct_pass($name); return; }
-    ct_fail($name,
-        "expected " . var_export($expected, true) .
-        ", got " . var_export($actual, true));
-}
-
-function ct_assert_true(bool $cond, string $name, string $why = ''): void {
-    if ($cond) { ct_pass($name); return; }
-    ct_fail($name, $why ?: 'condition was false');
-}
-
-// ---------------------------------------------------------------------------
-// Recorder driver
-// ---------------------------------------------------------------------------
-
-function ct_repo_root(): string {
-    return dirname(__DIR__);
-}
-
-function ct_extension_path(): string {
-    return ct_repo_root() . '/ext/modules/codetracer.so';
-}
-
-function ct_trace_format_nim_dir(): string {
-    $env = getenv('TRACE_FORMAT_NIM_DIR');
-    if ($env !== false && $env !== '') return $env;
-    return ct_repo_root() . '/../codetracer-trace-format-nim';
-}
-
-function ct_print_path(): string {
-    return ct_trace_format_nim_dir() . '/ct-print';
-}
-
-function ct_ld_library_path(): string {
-    $cur = getenv('LD_LIBRARY_PATH');
-    $libdir = ct_trace_format_nim_dir();
-    return $libdir . ($cur ? ':' . $cur : '');
-}
-
-/**
- * Record a test program by spawning a fresh `php` subprocess with the
- * extension loaded.  Returns [status, stdout, stderr, traceDir].
- * Bails out on a recorder-side fatal (php exit != 0) — we want
- * recorder failures to surface as test failures, not silent skips.
- */
-function ct_record(string $programPath): array {
-    $traceDir = sys_get_temp_dir() . '/ct_php_e2e_' . bin2hex(random_bytes(6));
-    if (!mkdir($traceDir, 0755, true) && !is_dir($traceDir)) {
-        throw new RuntimeException("could not create $traceDir");
-    }
-
-    $env = [
-        'CODETRACER_ENABLED' => '1',
-        'CODETRACER_TRACE_DIR' => $traceDir,
-        'LD_LIBRARY_PATH' => ct_ld_library_path(),
-        'PATH' => getenv('PATH') ?: '/usr/bin:/bin',
-        'HOME' => getenv('HOME') ?: '/tmp',
-    ];
-
-    $cmd = [
-        'php',
-        '-d', 'extension=' . ct_extension_path(),
-        $programPath,
-    ];
-
-    $descriptors = [
-        0 => ['pipe', 'r'],
-        1 => ['pipe', 'w'],
-        2 => ['pipe', 'w'],
-    ];
-    $proc = proc_open($cmd, $descriptors, $pipes, ct_repo_root(), $env);
-    if (!is_resource($proc)) {
-        throw new RuntimeException("failed to spawn php subprocess");
-    }
-    fclose($pipes[0]);
-    $stdout = stream_get_contents($pipes[1]);
-    fclose($pipes[1]);
-    $stderr = stream_get_contents($pipes[2]);
-    fclose($pipes[2]);
-    $status = proc_close($proc);
-
-    return [
-        'status' => $status,
-        'stdout' => $stdout,
-        'stderr' => $stderr,
-        'traceDir' => $traceDir,
-    ];
-}
-
-/**
- * Decode the recorder's `.ct` CTFS container into the legacy-schema
- * JSON event array via `ct-print --json-events`, then translate the
- * new-format events into the projection-friendly legacy shape this
- * suite already asserts on (`{Step:{...}}`, `{Call:{...}}`, ...).
- *
- * The new ct-print format uses `{type: "step", ...}` (lowercase),
- * doesn't emit standalone `Return` events (call records carry
- * `exit_step`), and renames a few fields.  The translator below maps
- * back to the legacy projection shape so the per-program test bodies
- * don't need to be rewritten — see ct_translate_to_legacy() for the
- * exact mapping.  When the test bodies migrate to the new schema,
- * this translator can be removed.
- */
-function ct_decode_events(string $traceDir): array {
-    $ct_print = ct_print_path();
-    if (!is_executable($ct_print)) {
-        throw new RuntimeException(
-            "ct-print binary not found or not executable at $ct_print " .
-            "(build it with `cd " . ct_trace_format_nim_dir() . " && nimble buildCtPrint`)");
-    }
-    $cts = glob($traceDir . '/*.ct');
-    if (!$cts) {
-        throw new RuntimeException(".ct file missing in $traceDir");
-    }
-    $ctPath = $cts[0];
-    $jsonOut = $traceDir . '/events.json';
-    // `--full` decodes call args, return values, and IO bytes —
-    // unlike `--json-events`, which emits a flat event stream
-    // without folding return values into the call records.  The
-    // policy mandates exact-decoded-value assertions, so we need
-    // `--full`.
-    $cmd = sprintf('%s --full %s > %s 2>&1',
-        escapeshellarg($ct_print),
-        escapeshellarg($ctPath),
-        escapeshellarg($jsonOut));
-    shell_exec($cmd);
-    if (!file_exists($jsonOut)) {
-        throw new RuntimeException("ct-print failed");
-    }
-    $raw = file_get_contents($jsonOut);
-    $clean = mb_convert_encoding($raw, 'UTF-8', 'UTF-8');
-    $doc = json_decode($clean, true, 512, JSON_THROW_ON_ERROR);
-    if (!is_array($doc) || !isset($doc['events'])) {
-        throw new RuntimeException("decoded document missing events[]");
-    }
-    return ct_translate_to_legacy($doc);
-}
-
-/**
- * EventLogKind name -> ordinal, as `codetracer-trace-format-spec`
- * `trace-events.md` §"EventLogKind (u8 enum)" assigns them.
- */
-const CT_EVENT_LOG_KINDS = [
-    'Write' => 0,
-    'WriteFile' => 1,
-    'WriteOther' => 2,
-    'Read' => 3,
-    'ReadFile' => 4,
-    'ReadOther' => 5,
-    'ReadDir' => 6,
-    'OpenDir' => 7,
-    'CloseDir' => 8,
-    'Socket' => 9,
-    'Open' => 10,
-    'Error' => 11,
-    'TraceLogEvent' => 12,
-    'EvmEvent' => 13,
-];
-
-/**
- * Map a ct-print --full document into the legacy projection shape
- * (`{Step:{...}}`, `{Call:{...}}`, `{Value:{...}}`, ...) so the
- * per-program assertions in this file don't need rewriting.
- *
- * `--full` gives us:
- *   * top-level paths[], functions[], varnames[], types[] arrays
- *     (interning tables) — translated to the legacy declaration
- *     events.
- *   * events[] with `kind` discriminator: call_entry, call_exit,
- *     step, value, io.  call_exit carries the decoded
- *     return_value, so we map it to the legacy Return event.
- *
- * The synthetic `<toplevel>` frame (depth==0, name=="<toplevel>")
- * gets a Call but no Return, mirroring the legacy convention that
- * the outermost frame never emitted a standalone Return event.
- */
-function ct_translate_to_legacy(array $doc): array {
-    $out = [];
-    foreach (($doc['paths'] ?? []) as $i => $name) {
-        $out[] = ['Path' => $name];
-    }
-    foreach (($doc['functions'] ?? []) as $i => $name) {
-        $out[] = ['Function' => ['id' => $i, 'name' => $name]];
-    }
-    foreach (($doc['varnames'] ?? []) as $i => $name) {
-        $out[] = ['VariableName' => ['id' => $i, 'name' => $name]];
-    }
-    foreach (($doc['types'] ?? []) as $i => $name) {
-        $out[] = ['Type' => ['id' => $i, 'lang_type' => $name]];
-    }
-    foreach (($doc['events'] ?? []) as $e) {
-        $k = $e['kind'] ?? null;
-        switch ($k) {
-            case 'call_entry':
-                $out[] = ['Call' => [
-                    'function_id' => $e['function_id'],
-                    'function' => $e['function'] ?? null,
-                    'depth' => $e['depth'] ?? 0,
-                    'entry_step' => $e['entry_step'] ?? 0,
-                    'exit_step' => $e['exit_step'] ?? 0,
-                ]];
-                break;
-            case 'call_exit':
-                // Synthetic <toplevel> never emits a Return event —
-                // matches the legacy projection convention.
-                $isToplevel = ($e['depth'] ?? 0) === 0
-                    && (($e['function'] ?? '') === '<toplevel>');
-                if (!$isToplevel) {
-                    // ct-print --full emits {kind:"Void"} for
-                    // implicit-return frames (constructors, throw-
-                    // exit paths, register_return-with-no-value).
-                    // The legacy projection used {kind:"None"} for
-                    // both — map Void → None to keep parity.
-                    $rv = $e['return_value'] ?? ['kind' => 'None'];
-                    if (($rv['kind'] ?? '') === 'Void') {
-                        $rv = ['kind' => 'None'];
-                    }
-                    $out[] = ['Return' => [
-                        'function_id' => $e['function_id'],
-                        'function' => $e['function'] ?? null,
-                        'return_value' => $rv,
-                    ]];
-                }
-                break;
-            case 'step':
-                $out[] = ['Step' => [
-                    'path_id' => $e['path_id'] ?? null,
-                    'line' => $e['line'] ?? null,
-                    'function_id' => $e['function_id'] ?? null,
-                    'function' => $e['function'] ?? null,
-                    'depth' => $e['depth'] ?? 0,
-                    'step_index' => $e['step_index'] ?? null,
-                ]];
-                break;
-            case 'value':
-                $out[] = ['Value' => [
-                    'variable_id' => $e['varname_id'] ?? null,
-                    'varname' => $e['varname'] ?? null,
-                    'value' => $e['value'] ?? null,
-                    'type_id' => $e['type_id'] ?? null,
-                ]];
-                break;
-            case 'io':
-                // `io_kind` is the EventLogKind name as `trace-events.md`
-                // §"EventLogKind (u8 enum)" spells it; the projection
-                // keeps the numeric ordinal that table assigns.
-                // `metadata` is the recorder's own stream label, stored
-                // verbatim in the container.
-                $ioKind = $e['io_kind'] ?? null;
-                if (!array_key_exists($ioKind, CT_EVENT_LOG_KINDS)) {
-                    throw new RuntimeException(
-                        'io event has an io_kind that is not an EventLogKind: ' .
-                        json_encode($ioKind));
-                }
-                $out[] = ['Event' => [
-                    'kind' => CT_EVENT_LOG_KINDS[$ioKind],
-                    'metadata' => $e['metadata'] ?? null,
-                    'content' => $e['text'] ?? '',
-                ]];
-                break;
-        }
-    }
-    return $out;
-}
-
-/**
- * Project the event stream into per-kind sequences.  Returns an
- * associative array keyed by event kind ('Function', 'Call', 'Step',
- * 'Value', 'Return', 'Event', 'VariableName', 'Path', 'Type') with
- * one entry per event preserving order.  Used by the per-program
- * tests to make EXACT-order assertions without being brittle to the
- * Type / Path preludes the recorder always emits.
- */
-function ct_project(array $events): array {
-    $bins = [];
-    foreach ($events as $e) {
-        $k = array_key_first($e);
-        if ($k === null) continue;
-        if (!isset($bins[$k])) $bins[$k] = [];
-        $bins[$k][] = $e[$k];
-    }
-    return $bins;
-}
-
-/**
- * Reject any unexpected `ValueRecord` variant for a given variable.
- * Mirrors the cardano test_tracer.rs `observed_int_vars` pattern: we
- * want a hard failure with a clear message rather than a silent
- * tolerance for a new variant.
- */
-function ct_assert_value_int_kind(array $value, string $context): int {
-    if (($value['kind'] ?? null) !== 'Int') {
-        throw new RuntimeException(
-            "[$context] expected ValueRecord::Int, got " .
-            json_encode($value) .
-            "; if a new variant has landed, extend the test " .
-            "to assert on it explicitly rather than weakening the check");
-    }
-    if (!is_int($value['i'] ?? null)) {
-        throw new RuntimeException(
-            "[$context] expected Int.i to be an int; got " . json_encode($value));
-    }
-    return $value['i'];
-}
-
-function ct_assert_value_raw_kind(array $value, string $context): string {
-    if (($value['kind'] ?? null) !== 'Raw') {
-        throw new RuntimeException(
-            "[$context] expected ValueRecord::Raw, got " .
-            json_encode($value) .
-            "; if a new variant has landed, extend the test " .
-            "to assert on it explicitly rather than weakening the check");
-    }
-    if (!is_string($value['r'] ?? null)) {
-        throw new RuntimeException(
-            "[$context] expected Raw.r to be a string; got " . json_encode($value));
-    }
-    return $value['r'];
-}
 
 // ---------------------------------------------------------------------------
 // Sanity: the extension must build and the decoder must exist.  Both
@@ -429,16 +77,11 @@ $programs_dir = __DIR__ . '/programs';
 // The recorder MUST surface these five (name, i64) pairs as step
 // variable values.
 //
-// RECORDER BUG: per-statement step granularity.  The PHP extension's
-// `zend_execute_ex` hook fires once per function entry (at
-// `op_array.line_start`) — it does NOT install a `zend_observer`
-// per-opcode trampoline, so the per-let-binding values inside
-// `compute()` are never emitted as scoped variables.  See
-// `AUDIT-CTFS-2026-05.md` open gap "Per-opcode step granularity".
-// Until the recorder grows opcode-level observation, the canonical
-// flow_test variable assertion CANNOT pass; we pin the present-day
-// shape (Return value of 94 from `compute`) and provide a sibling
-// SKIP test capturing the spec-correct expectation.
+// The recorder steps once per executed statement (the compiler's
+// `EXT_STMT` marker), plus the call's entry step at the `function` line,
+// and every step carries the frame's defined local variables as they
+// stand when the step is reached — the same shape the Python and Ruby
+// recorders produce from their per-line events.
 // =========================================================================
 
 echo "\n==> flow_test.php (canonical §4 fixture)\n";
@@ -456,9 +99,65 @@ $proj = ct_project($events);
 ct_assert_eq(1, count($proj['Path'] ?? []), 'flow_test: 1 path registered');
 ct_assert_eq(2, count($proj['Function'] ?? []), 'flow_test: 2 functions registered (<toplevel>, compute)');
 ct_assert_eq(2, count($proj['Call'] ?? []), 'flow_test: 2 calls (<toplevel>, compute)');
-ct_assert_eq(2, count($proj['Step'] ?? []), 'flow_test: 2 step events (call entry + post-return)');
 ct_assert_eq(1, count($proj['Return'] ?? []), 'flow_test: 1 return (compute) -- <toplevel> has no Return');
 ct_assert_eq(1, count($proj['Event'] ?? []), 'flow_test: 1 io event (the echo)');
+ct_assert_eq(0, count($proj['Raise'] ?? []), 'flow_test: no Raise records');
+
+// EXACT step sequence: the entry step `start` emits at line 1, one step
+// per executed statement, and compute()'s entry step at its `function`
+// line.  The `function compute()` declaration is hoisted at compile time
+// and executes no statement, so it has no step.
+ct_assert_eq(
+    [
+        '<toplevel>:1',   // the entry step trace_writer_start emits
+        '<toplevel>:32',  // $result = compute();
+        'compute:23',     // entry step, at the `function` line
+        'compute:24',     // $a = 10;
+        'compute:25',     // $b = 32;
+        'compute:26',     // $sum_val = $a + $b;
+        'compute:27',     // $doubled = $sum_val * 2;
+        'compute:28',     // $final_result = $doubled + $a;
+        'compute:29',     // return $final_result;
+        '<toplevel>:36',  // echo ...
+    ],
+    ct_step_positions($proj),
+    'flow_test: one step per executed statement, in execution order');
+
+// EXACT values at every step: a statement's step shows the locals as they
+// stand BEFORE the statement runs, so each binding first appears at the
+// step after its assignment, and never at a step where it is undefined.
+$a = ['a', ['Int', 10]];
+$b = ['b', ['Int', 32]];
+$sum = ['sum_val', ['Int', 42]];
+$dbl = ['doubled', ['Int', 84]];
+$fin = ['final_result', ['Int', 94]];
+ct_assert_eq(
+    [
+        [],
+        [],
+        [],
+        [],
+        [$a],
+        [$a, $b],
+        [$a, $b, $sum],
+        [$a, $b, $sum, $dbl],
+        [$a, $b, $sum, $dbl, $fin],
+        [['result', ['Int', 94]]],
+    ],
+    array_map('ct_step_vars', $proj['Step'] ?? []),
+    'flow_test: exact variables at each step');
+
+// The canonical §4 assertion, stated on its own: each of the five
+// (name, i64) pairs surfaces as a step variable, decoded as Int.
+$seen = [];
+foreach (($proj['Step'] ?? []) as $st) {
+    foreach (ct_step_vars($st) as [$name, $val]) {
+        if ($val[0] === 'Int') $seen[$name] = $val[1];
+    }
+}
+foreach (['a' => 10, 'b' => 32, 'sum_val' => 42, 'doubled' => 84, 'final_result' => 94] as $name => $want) {
+    ct_assert_eq($want, $seen[$name] ?? null, "flow_test: canonical variable $name = $want");
+}
 
 // EXACT function table (writer-assignment order).
 $fnames = array_map(fn($f) => $f['name'], $proj['Function'] ?? []);
@@ -477,22 +176,14 @@ $rv = $rets[0]['return_value'];
 $rvi = ct_assert_value_int_kind($rv, 'flow_test: compute return');
 ct_assert_eq(94, $rvi, 'flow_test: compute returns 94 (decoded as Int)');
 
-// EXACT io_event content.
+// EXACT io_event content, attributed to the echo statement's step.
 $ioev = $proj['Event'][0];
 ct_assert_eq(0, $ioev['kind'], 'flow_test: io_event kind = ELK_WRITE (0)');
 ct_assert_eq('stdout', $ioev['metadata'], 'flow_test: io_event metadata = stdout');
 ct_assert_eq("flow_test result: 94\n", $ioev['content'], 'flow_test: io_event content');
-
-// SKIP: per-let-binding variable values (a=10, b=32, sum_val=42, doubled=84, final_result=94).
-// RECORDER BUG: per-statement step granularity is not implemented;
-// see file-level note above.  The recorder only emits `Step` at
-// function entry, so the let-bindings inside compute() never surface
-// as scoped variables.  Tracking issue: extend `codetracer_php.c`
-// `codetracer_execute_ex` to register a `zend_observer_fcall_init`
-// hook for per-opcode step capture (PHP 8.0+ observer API).
-ct_skip('flow_test: canonical (a,b,sum_val,doubled,final_result) variables surface',
-    'RECORDER BUG: PHP recorder lacks per-statement step granularity. ' .
-    'Tracked in AUDIT-CTFS-2026-05.md "Per-opcode step granularity".');
+$ioStep = ct_step_at($proj, $ioev['step_id']);
+ct_assert_eq('<toplevel>:36', $ioStep['function'] . ':' . $ioStep['line'],
+    'flow_test: the echo output belongs to the echo statement\'s step');
 
 // =========================================================================
 // nested_calls.php — 4-deep chain + recursive factorial.
@@ -684,21 +375,9 @@ ct_assert_eq(
     $fnames,
     'exceptions: function table');
 
-// EXACT return sequence.  When raise_*() throws, its Return event is
-// `None` (the recorder's after-execute path always emits a Return
-// even on the exception-propagation exit — see `codetracer_execute_ex`,
-// the post-call branch unconditionally calls `register_return*` when
-// `have_info` is set).
-//
-// RECORDER BUG: thrown exceptions are not surfaced as a separate
-// `RecordEvent`/`ELK_ERROR` event.  The recorder emits a None
-// Return, indistinguishable from a void function.  Per
-// recorder-test-requirements.md §2 "Exceptions / errors", a
-// raise-with-handler MUST produce a `RecordEvent` of
-// `EventKindError`.  The PHP recorder does not yet hook
-// zend_throw_exception_internal; tracking: add an ELK_ERROR special
-// event in the throw-hook path, mirroring the canonical pattern
-// from cardano test_tracer.rs `test_error_paths_test_emits_fail_event`.
+// EXACT return sequence.  A raise_*() frame that throws exits by the
+// exception: its call record carries the exception, and no return value
+// (the VoidReturn marker, projected as None).
 $rets = $proj['Return'];
 
 // Order:
@@ -725,12 +404,110 @@ ct_assert_eq('finally1->caught:app-failure',
     ct_assert_value_raw_kind($rets[7]['return_value'], 'with_finally'),
     'exceptions: with_finally returns "finally1->caught:app-failure"');
 
-// SKIP: ELK_ERROR special-event for thrown exceptions.
-ct_skip('exceptions: thrown exceptions surface as ELK_ERROR special event',
-    'RECORDER BUG: zend_throw_exception_internal is not hooked. ' .
-    'Spec (§2): raise-with-handler MUST produce a RecordEvent of EventKindError. ' .
-    'Tracking: add an ELK_ERROR call in the throw-hook path, mirroring ' .
-    'cardano test_tracer.rs::test_error_paths_test_emits_fail_event.');
+[$events, $doc] = ct_decode_with_doc($rec['traceDir']);
+$proj = ct_project($events);
+$rets = $proj['Return'];
+
+// EXACT exception carried by each call record: the four raise_*() frames
+// exit by their exception, decoded as ValueRecord::Error whose type is the
+// exception's class; every other frame returned normally.
+$exits = [];
+foreach ($rets as $r) {
+    $exits[] = $r['exception'] === null ? null : [
+        $r['function'],
+        ct_value_brief($r['exception']),
+        ct_type_name($doc, $r['exception']),
+    ];
+}
+ct_assert_eq(
+    [
+        ['raise_app', ['Error', 'app-failure'], 'AppError'],
+        null,
+        ['raise_net', ['Error', 'net-failure'], 'NetworkError'],
+        null,
+        ['raise_fmt', ['Error', 'fmt-failure'], 'FormatError'],
+        null,
+        ['raise_app', ['Error', 'app-failure'], 'AppError'],
+        null,
+    ],
+    $exits,
+    'exceptions: exactly the throwing frames exit by their exception');
+
+// EXACT Raise records: one per throw, in order, each inside the frame that
+// threw and at the throw statement.  The re-throw in with_finally() is a
+// throw of its own.
+$raises = array_map(fn($r) => [$r['type'], $r['message'], $r['function'] . ':' . $r['line']],
+    $proj['Raise'] ?? []);
+ct_assert_eq(
+    [
+        ['AppError', 'app-failure', 'raise_app:22'],
+        ['NetworkError', 'net-failure', 'raise_net:23'],
+        ['FormatError', 'fmt-failure', 'raise_fmt:24'],
+        ['AppError', 'app-failure', 'raise_app:22'],
+        ['AppError', 'app-failure', 'with_finally:46'],
+    ],
+    $raises,
+    'exceptions: one Raise per throw, at the throw, with type and message');
+
+// EXACT Catch records: one per handler that took an exception, in the frame
+// whose `catch` matched, naming the caught exception's class.  A `catch`
+// clause that does not match records nothing, and `finally` is not a catch.
+$catches = array_map(fn($c) => [$c['type'], $c['function']], $proj['Catch'] ?? []);
+ct_assert_eq(
+    [
+        ['AppError', 'classify_error'],
+        ['NetworkError', 'classify_error'],
+        ['FormatError', 'classify_error'],
+        ['AppError', 'with_finally'],
+        ['AppError', 'with_finally'],
+    ],
+    $catches,
+    'exceptions: one Catch per handled exception, in the catching frame');
+
+// The exec order of the exception records: every Raise precedes the Catch
+// that handles it, and each Catch comes after the thrower has exited.
+$order = [];
+foreach ($events as $ev) {
+    $k = array_key_first($ev);
+    if ($k === 'Raise') $order[] = 'R';
+    if ($k === 'Catch') $order[] = 'C';
+    if ($k === 'Return' && $ev['Return']['exception'] !== null) $order[] = 'X';
+}
+ct_assert_eq(['R', 'X', 'C', 'R', 'X', 'C', 'R', 'X', 'C', 'R', 'X', 'C', 'R', 'C'], $order,
+    'exceptions: raise, exit by exception, then catch -- in that order');
+
+// EXACT Error I/O events: one per thrown exception (recorder-test-
+// requirements §2: a function that catches an exception must produce an
+// EventKindError event).  As in the Ruby recorder the content is the
+// exception's message and the metadata is empty; each is attributed to the
+// throw statement's step.  The four `echo` lines are Write events.
+$errs = [];
+$writes = [];
+foreach (($proj['Event'] ?? []) as $ev) {
+    if ($ev['kind'] === CT_EVENT_LOG_KINDS['Error']) {
+        $st = ct_step_at($proj, $ev['step_id']);
+        $errs[] = [$ev['metadata'], $ev['content'], $st['function'] . ':' . $st['line']];
+    } elseif ($ev['kind'] === CT_EVENT_LOG_KINDS['Write']) {
+        $writes[] = $ev['content'];
+    } else {
+        ct_fail('exceptions: io event kind', 'unexpected kind ' . $ev['kind']);
+    }
+}
+ct_assert_eq(
+    [
+        ['', 'app-failure', 'raise_app:22'],
+        ['', 'net-failure', 'raise_net:23'],
+        ['', 'fmt-failure', 'raise_fmt:24'],
+        ['', 'app-failure', 'raise_app:22'],
+        ['', 'app-failure', 'with_finally:46'],
+    ],
+    $errs,
+    'exceptions: one Error event per thrown exception, at the throw');
+ct_assert_eq(
+    ["app=app:app-failure\n", "net=net:net-failure\n", "fmt=fmt:fmt-failure\n",
+     "fin=finally1->caught:app-failure\n"],
+    $writes,
+    'exceptions: the four echo lines are Write events');
 
 // Verify that the unhandled-throw branch terminates the program with
 // non-zero exit + the exception message on stderr.  This exercises
@@ -767,6 +544,44 @@ ct_assert_true(str_contains($combined, 'unhandled'),
 $cts2 = glob($traceDir2 . '/*.ct');
 ct_assert_true(!empty($cts2),
     'exceptions: --terminate still produced a .ct CTFS bundle (recorder runs to RSHUTDOWN)');
+
+// The uncaught exception is recorded like a caught one -- a Raise at the
+// throw, an Error event with its message -- and the frame it escapes from
+// exits by it.  Nothing catches it, so there is no Catch record.
+[$events2, $doc2] = ct_decode_with_doc($traceDir2);
+$proj2 = ct_project($events2);
+ct_assert_eq(
+    [
+        ['AppError', 'app-failure', 'raise_app:22'],
+        ['NetworkError', 'net-failure', 'raise_net:23'],
+        ['FormatError', 'fmt-failure', 'raise_fmt:24'],
+        ['AppError', 'app-failure', 'raise_app:22'],
+        ['AppError', 'app-failure', 'with_finally:46'],
+        ['RuntimeException', 'unhandled', 'will_terminate:70'],
+    ],
+    array_map(fn($r) => [$r['type'], $r['message'], $r['function'] . ':' . $r['line']], $proj2['Raise'] ?? []),
+    'exceptions --terminate: the uncaught throw is a Raise at the throw');
+ct_assert_eq(5, count($proj2['Catch'] ?? []),
+    'exceptions --terminate: the uncaught exception adds no Catch');
+$errs2 = array_values(array_filter($proj2['Event'] ?? [],
+    fn($e) => $e['kind'] === CT_EVENT_LOG_KINDS['Error']));
+ct_assert_eq(6, count($errs2), 'exceptions --terminate: 6 Error events');
+$lastErr = end($errs2);
+if ($lastErr === false) {
+    ct_fail('exceptions --terminate: the uncaught exception is an Error event at its throw',
+        'the recording has no Error event');
+} else {
+    $lastErrStep = ct_step_at($proj2, $lastErr['step_id']);
+    ct_assert_eq(['', 'unhandled', 'will_terminate:70'],
+        [$lastErr['metadata'], $lastErr['content'], $lastErrStep['function'] . ':' . $lastErrStep['line']],
+        'exceptions --terminate: the uncaught exception is an Error event at its throw');
+}
+$lastRet = end($proj2['Return']);
+ct_assert_eq(['will_terminate', ['Error', 'unhandled'], 'RuntimeException'],
+    [$lastRet['function'],
+     $lastRet['exception'] === null ? null : ct_value_brief($lastRet['exception']),
+     ct_type_name($doc2, $lastRet['exception'])],
+    'exceptions --terminate: will_terminate exits by the uncaught exception');
 
 // =========================================================================
 // closures.php — Closure::bind, arrow functions, value vs ref captures.
@@ -862,16 +677,105 @@ ct_assert_eq("range=1,2,3,4,ret=4\n", $proj['Event'][0]['content'],
 ct_assert_eq("keyed=a=1,b=2,c=3\n", $proj['Event'][1]['content'],
     'generators: keyed echo content');
 
-// SKIP: yielded value sequence (1, 2, 3, 4 from int_range and
-// "a"=>1, "b"=>2, "c"=>3 from keyed) should surface as a sequence
-// of step-variable values OR a dedicated yield event.
-ct_skip('generators: yielded values surface as step variables / yield events',
-    'RECORDER BUG: PHP recorder does not specialise zend_generator ' .
-    'resumption; yielded values are not captured because the per-statement ' .
-    'step granularity is missing (same root cause as flow_test).  ' .
-    'Tracking: combine the per-opcode step hook with a generator-aware ' .
-    'capture path, mirroring the python recorder yield-event handling ' .
-    '(handoff entry 1.27).');
+// A generator frame is one call per stretch of execution, as in the
+// Python recorder: calling the generator function binds its arguments and
+// returns the Generator object (PHP runs the frame up to its
+// GENERATOR_CREATE), every resumption opens a NEW call of the generator
+// function, and every suspension returns the value it yielded.  The final
+// resumption returns the generator's own return value.
+$callsOf = function (array $proj, string $fn): array {
+    return array_values(array_filter($proj['Call'] ?? [], fn($c) => $c['function'] === $fn));
+};
+$returnsOf = function (array $proj, string $fn): array {
+    return array_values(array_map(fn($r) => ct_value_brief($r['return_value']),
+        array_filter($proj['Return'] ?? [], fn($r) => $r['function'] === $fn)));
+};
+// Each call's entry step: [line, variables at that step].
+$entriesOf = function (array $proj, string $fn) use ($callsOf): array {
+    return array_map(function ($c) use ($proj) {
+        $st = ct_step_at($proj, $c['entry_step']);
+        return [$st['line'], ct_step_vars($st)];
+    }, $callsOf($proj, $fn));
+};
+
+ct_assert_eq(
+    [['Raw', 'Generator {}'], ['Int', 1], ['Int', 2], ['Int', 3], ['Int', 4], ['Int', 4]],
+    $returnsOf($proj, 'int_range'),
+    'generators: int_range returns the Generator, then each yielded value, then its return value');
+ct_assert_eq(
+    [['Raw', 'Generator {}'], ['Int', 1], ['Int', 2], ['Int', 3], ['Raw', 'null']],
+    $returnsOf($proj, 'keyed'),
+    'generators: keyed returns the Generator, then each yielded value, then null');
+
+// Where each stretch starts: the creating call at the `function` line with
+// the bound arguments; the first resumption at the start of the body; every
+// later resumption at the `yield` it was suspended at, with the locals as
+// they stood there.
+$lo = ['lo', ['Int', 1]];
+$hi = ['hi', ['Int', 4]];
+ct_assert_eq(
+    [
+        [19, [$lo, $hi]],
+        [19, [$lo, $hi]],
+        [21, [$lo, $hi, ['i', ['Int', 1]]]],
+        [21, [$lo, $hi, ['i', ['Int', 2]]]],
+        [21, [$lo, $hi, ['i', ['Int', 3]]]],
+        [21, [$lo, $hi, ['i', ['Int', 4]]]],
+    ],
+    $entriesOf($proj, 'int_range'),
+    'generators: int_range entry steps (line, locals) across creation and resumptions');
+ct_assert_eq(
+    [[26, []], [26, []], [27, []], [28, []], [29, []]],
+    $entriesOf($proj, 'keyed'),
+    'generators: keyed entry steps resume at the yield that suspended it');
+
+// Every yield is a step of the resumed call, so the consumer's loop body
+// and the generator's body alternate in the step stream.
+$yieldSteps = array_values(array_filter(ct_step_positions($proj),
+    fn($p) => $p === 'int_range:21'));
+ct_assert_eq(8, count($yieldSteps),
+    'generators: 4 yield statements, each stepped once and resumed once');
+
+// =========================================================================
+// generator_send.php — values sent INTO a generator.
+// =========================================================================
+
+echo "\n==> generator_send.php (Generator::send)\n";
+$rec = ct_record($programs_dir . '/generator_send.php');
+ct_assert_eq(0, $rec['status'], 'generator_send php exit status');
+
+$events = ct_decode_events($rec['traceDir']);
+$proj = ct_project($events);
+
+$fnames = array_map(fn($f) => $f['name'], $proj['Function'] ?? []);
+ct_assert_eq(['<toplevel>', 'drive_accumulator', 'accumulator'], $fnames,
+    'generator_send: function table');
+// <toplevel> + drive_accumulator + accumulator's creation and its four
+// resumptions (current(), send(5), send(7), send(null)).
+ct_assert_eq(7, count($proj['Call'] ?? []), 'generator_send: 7 call events');
+ct_assert_eq(
+    [['Raw', 'Generator {}'], ['Int', 0], ['Int', 5], ['Int', 12], ['Int', 12]],
+    $returnsOf($proj, 'accumulator'),
+    'generator_send: accumulator yields 0, 5, 12, then returns 12');
+ct_assert_eq([['Int', 12]], $returnsOf($proj, 'drive_accumulator'),
+    'generator_send: drive_accumulator returns 12');
+
+// A resumption by send() carries the sent value as `<sent>` on its entry
+// step -- the value the suspended `yield` expression evaluates to.  The
+// first resumption, by current(), received nothing.
+ct_assert_eq(
+    [
+        [15, []],
+        [15, []],
+        [18, [['total', ['Int', 0]], ['<sent>', ['Int', 5]]]],
+        [18, [['total', ['Int', 5]], ['x', ['Int', 5]], ['<sent>', ['Int', 7]]]],
+        [18, [['total', ['Int', 12]], ['x', ['Int', 7]], ['<sent>', ['Raw', 'null']]]],
+    ],
+    $entriesOf($proj, 'accumulator'),
+    'generator_send: each send() resumption records the value it delivered');
+
+ct_assert_eq(1, count($proj['Event'] ?? []), 'generator_send: 1 io event');
+ct_assert_eq("acc=12\n", $proj['Event'][0]['content'] ?? null, 'generator_send: echo content');
 
 // ---------------------------------------------------------------------------
 // Summary

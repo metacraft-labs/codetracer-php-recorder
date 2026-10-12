@@ -27,7 +27,10 @@ build-ext: build
 # sibling `codetracer-trace-format-nim` checkout.  The flake's shellHook
 # sets `TRACE_FORMAT_NIM_DIR` to that sibling, so we resolve the lib
 # dir from it rather than the legacy `../../` path.
-#   4. RS-M7 request-span integration tests — a real `php -S` process and a
+#   4. Recorder-semantics tests — one small program per rule (a step per
+#      statement, values per step, exceptions, generators), decoded the
+#      same way as the e2e suite.
+#   5. RS-M7 request-span integration tests — a real `php -S` process and a
 #      real php-fpm pool recorded end to end, asserted through the canonical
 #      Nim span reader (`ct_spans_json`).  This is the ONLY runner the repo
 #      has, so a test file that is not listed here runs nowhere (see
@@ -46,6 +49,8 @@ test: build
     php -d extension=ext/modules/codetracer.so tests/test_extension.php
     LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
     php tests/test_e2e.php
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
+    php tests/test_recorder_semantics.php
     just test-request-spans
 
 # RS-M7 request-span integration tests only.
@@ -88,6 +93,11 @@ test-ext: build
     CODETRACER_ENABLED=1 CODETRACER_OUTPUT_DIR=/tmp/codetracer_test_traces \
     LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
     php -d extension=ext/modules/codetracer.so tests/test_extension.php
+
+# Recorder-semantics tests only.
+test-semantics: build
+    LD_LIBRARY_PATH="${TRACE_FORMAT_NIM_DIR}:${LD_LIBRARY_PATH:-}" \
+    php tests/test_recorder_semantics.php
 
 # End-to-end per-program suite only (requires `just build` first).
 test-e2e: build

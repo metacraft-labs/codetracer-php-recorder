@@ -347,6 +347,27 @@ void trace_writer_register_thread_exit(trace_writer_t handle, uint64_t thread_id
 void trace_writer_register_thread_switch(trace_writer_t handle, uint64_t thread_id);
 
 /* --------------------------------------------------------------------------
+ * Exceptions
+ *
+ * Raise and Catch are step-stream events (`trace-events.md` tags 0x02 and
+ * 0x03); a call that exits by an exception carries it, as CBOR, in its call
+ * record's `exception`. The split-stream writer only: on the legacy writer
+ * each refuses by name through trace_writer_last_error.
+ * -------------------------------------------------------------------------- */
+
+/* An exception of the interned type `exception_type_id` is raised, with
+ * `message_len` bytes of message (`message` may be NULL when it is 0). */
+void trace_writer_register_raise(trace_writer_t handle, uint64_t exception_type_id,
+                                 const uint8_t* message, size_t message_len);
+/* An exception of the interned type `exception_type_id` is caught. */
+void trace_writer_register_catch(trace_writer_t handle, uint64_t exception_type_id);
+/* The innermost call exits by an exception: `exception_len` (> 0) bytes of
+ * CBOR, recorded as its call record's `exception`, with no return value. */
+void trace_writer_register_return_exception(trace_writer_t handle,
+                                            const uint8_t* exception_cbor,
+                                            size_t exception_len);
+
+/* --------------------------------------------------------------------------
  * meta.dat — write via trace writer handle
  * -------------------------------------------------------------------------- */
 
