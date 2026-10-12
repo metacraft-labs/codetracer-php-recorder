@@ -84,6 +84,16 @@ typedef void TraceWriterHandle;
 #define ELK_ERROR              11
 #define ELK_TRACE_LOG_EVENT    12
 #define ELK_EVM_EVENT          13
+#define ELK_WRITE_STDERR       14
+#define ELK_EXEC               15
+#define ELK_READ_ENV           16
+#define ELK_WRITE_ENV          17
+#define ELK_STAT               18
+#define ELK_CREATE_DIR         19
+#define ELK_REMOVE_DIR         20
+#define ELK_REMOVE_FILE        21
+#define ELK_RENAME             22
+#define ELK_CHANGE_DIR         23
 
 /* --------------------------------------------------------------------------
  * FFI enums (must match Rust codetracer_trace_writer_ffi repr(C) values)
@@ -146,7 +156,17 @@ enum FfiEventLogKind {
     FFI_EVENT_OPEN = 10,
     FFI_EVENT_ERROR = 11,
     FFI_EVENT_TRACE_LOG_EVENT = 12,
-    FFI_EVENT_EVM_EVENT = 13
+    FFI_EVENT_EVM_EVENT = 13,
+    FFI_EVENT_WRITE_STDERR = 14,
+    FFI_EVENT_EXEC = 15,
+    FFI_EVENT_READ_ENV = 16,
+    FFI_EVENT_WRITE_ENV = 17,
+    FFI_EVENT_STAT = 18,
+    FFI_EVENT_CREATE_DIR = 19,
+    FFI_EVENT_REMOVE_DIR = 20,
+    FFI_EVENT_REMOVE_FILE = 21,
+    FFI_EVENT_RENAME = 22,
+    FFI_EVENT_CHANGE_DIR = 23
 };
 
 /* --------------------------------------------------------------------------

@@ -204,6 +204,16 @@ const CT_EVENT_LOG_KINDS = [
     'Error' => 11,
     'TraceLogEvent' => 12,
     'EvmEvent' => 13,
+    'WriteStderr' => 14,
+    'Exec' => 15,
+    'ReadEnv' => 16,
+    'WriteEnv' => 17,
+    'Stat' => 18,
+    'CreateDir' => 19,
+    'RemoveDir' => 20,
+    'RemoveFile' => 21,
+    'Rename' => 22,
+    'ChangeDir' => 23,
 ];
 
 /**

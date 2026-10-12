@@ -63,6 +63,65 @@ if (!is_executable(ct_print_path())) {
 ct_pass("ct-print CTFS decoder exists");
 
 // ---------------------------------------------------------------------------
+// EventLogKind tables
+//
+// The canonical C ABI header shipped by codetracer-trace-format-nim is the
+// source of truth for the kind ordinals.  The decoder table above and the
+// vendored `ext/codetracer_trace_writer.h` must both carry every kind it
+// declares, with the same ordinal — a kind missing from the decoder would
+// make it refuse a valid trace, and a kind missing from the vendored header
+// would keep the recorder from emitting it.
+// ---------------------------------------------------------------------------
+
+echo "==> EventLogKind tables\n";
+
+/** `FFI_EVENT_WRITE_STDERR` -> `WriteStderr`. */
+function ct_ffi_event_name_to_kind(string $suffix): string {
+    return implode('', array_map(
+        fn($w) => ucfirst(strtolower($w)), explode('_', $suffix)));
+}
+
+/** Parse `#define <prefix>NAME N` / `<prefix>NAME = N` lines into NAME => N. */
+function ct_header_constants(string $header, string $pattern): array {
+    preg_match_all($pattern, file_get_contents($header), $m, PREG_SET_ORDER);
+    $out = [];
+    foreach ($m as $row) $out[$row[1]] = (int)$row[2];
+    return $out;
+}
+
+$canonical_header = ct_trace_format_nim_dir() . '/include/codetracer_trace_writer.h';
+$vendored_header = ct_repo_root() . '/ext/codetracer_trace_writer.h';
+$enum_pattern = '/^\s*FFI_EVENT_([A-Z_]+)\s*=\s*(\d+)/m';
+$canonical_ffi = ct_header_constants($canonical_header, $enum_pattern);
+ct_assert_eq(24, count($canonical_ffi),
+    'kinds: canonical header declares 24 EventLogKind values');
+
+$canonical_kinds = [];
+foreach ($canonical_ffi as $suffix => $ordinal) {
+    $canonical_kinds[ct_ffi_event_name_to_kind($suffix)] = $ordinal;
+}
+ct_assert_eq($canonical_kinds, CT_EVENT_LOG_KINDS,
+    'kinds: decoder table matches the canonical EventLogKind enum');
+ct_assert_eq($canonical_ffi,
+    ct_header_constants($vendored_header, $enum_pattern),
+    'kinds: vendored FFI_EVENT_* enum matches the canonical header');
+ct_assert_eq($canonical_ffi,
+    ct_header_constants($vendored_header, '/^#define\s+ELK_([A-Z_]+)\s+(\d+)/m'),
+    'kinds: vendored ELK_* aliases match the canonical header');
+
+try {
+    ct_translate_to_legacy(['events' => [
+        ['kind' => 'io', 'io_kind' => 'Kind24', 'text' => 'x'],
+    ]]);
+    ct_fail('kinds: decoder refuses an unknown io_kind', 'no exception thrown');
+} catch (RuntimeException $ex) {
+    ct_assert_true(str_contains($ex->getMessage(), '"Kind24"'),
+        'kinds: decoder refuses an unknown io_kind, naming it',
+        'message was: ' . $ex->getMessage());
+}
+
+
+// ---------------------------------------------------------------------------
 // Per-program tests
 // ---------------------------------------------------------------------------
 
