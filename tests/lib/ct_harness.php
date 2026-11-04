@@ -354,10 +354,19 @@ function ct_translate_to_legacy(array $doc): array {
                 // `metadata` is the recorder's own stream label, stored
                 // verbatim in the container.
                 $ioKind = $e['io_kind'] ?? null;
-                if (!array_key_exists($ioKind, CT_EVENT_LOG_KINDS)) {
-                    throw new RuntimeException(
+                if (!is_string($ioKind) || !array_key_exists($ioKind, CT_EVENT_LOG_KINDS)) {
+                    throw new UnexpectedValueException(
                         'io event has an io_kind that is not an EventLogKind: ' .
                         json_encode($ioKind));
+                }
+                // ct-print omits `metadata` only for an empty slot; a present
+                // metadata or a text that is not a string is a malformed record,
+                // never coerced into one.
+                if (!isset($e['text']) || !is_string($e['text']) ||
+                    (array_key_exists('metadata', $e) && !is_string($e['metadata']))) {
+                    throw new UnexpectedValueException(
+                        'io event text and present metadata must be strings: ' .
+                        json_encode($e));
                 }
                 $out[] = ['Event' => [
                     'step_id' => $e['step_id'] ?? null,

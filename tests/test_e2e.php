@@ -603,6 +603,14 @@ ct_assert_true(str_contains($combined, 'unhandled'),
 $cts2 = glob($traceDir2 . '/*.ct');
 ct_assert_true(!empty($cts2),
     'exceptions: --terminate still produced a .ct CTFS bundle (recorder runs to RSHUTDOWN)');
+// Every Error event of the terminating run, in order: the five handled throws
+// and the uncaught one.  (Their classes are asserted on the Raise records
+// below; an Error event's metadata is empty.)
+$terminatingEvents = ct_project(ct_decode_events($traceDir2));
+$terminatingErrors = array_values(array_filter($terminatingEvents['Event'] ?? [],
+    fn($event) => $event['kind'] === CT_EVENT_LOG_KINDS['Error']));
+ct_assert_eq(['app-failure', 'net-failure', 'fmt-failure', 'app-failure', 'app-failure', 'unhandled'],
+    array_column($terminatingErrors, 'content'), 'exceptions: handled and terminating decoded messages');
 
 // The uncaught exception is recorded like a caught one -- a Raise at the
 // throw, an Error event with its message -- and the frame it escapes from
@@ -835,6 +843,86 @@ ct_assert_eq(
 
 ct_assert_eq(1, count($proj['Event'] ?? []), 'generator_send: 1 io event');
 ct_assert_eq("acc=12\n", $proj['Event'][0]['content'] ?? null, 'generator_send: echo content');
+
+// ---------------------------------------------------------------------------
+// Negative recording control: the same real extension and runtime entry
+// point with recording disabled.  No mocks: the program's own output and the
+// trace directory on the real filesystem are checked.
+$disabledDir = sys_get_temp_dir() . '/ct_php_disabled_' . bin2hex(random_bytes(6));
+mkdir($disabledDir, 0755, true);
+$disabledEnv = $env2;
+$disabledEnv['CODETRACER_ENABLED'] = '0';
+$disabledEnv['CODETRACER_TRACE_DIR'] = $disabledDir;
+$disabledProc = proc_open([
+    'php', '-d', 'extension=' . ct_extension_path(), $programs_dir . '/flow_test.php',
+], $descs, $disabledPipes, ct_repo_root(), $disabledEnv);
+if (!is_resource($disabledProc)) throw new RuntimeException('failed to spawn disabled recording control');
+fclose($disabledPipes[0]);
+$disabledStdout = stream_get_contents($disabledPipes[1]); fclose($disabledPipes[1]);
+$disabledStderr = stream_get_contents($disabledPipes[2]); fclose($disabledPipes[2]);
+ct_assert_eq(0, proc_close($disabledProc), 'disabled recording: normal PHP exit');
+ct_assert_eq("flow_test result: 94\n", $disabledStdout, 'disabled recording: arithmetic output unchanged');
+ct_assert_eq('', $disabledStderr, 'disabled recording: no runtime diagnostics');
+ct_assert_eq([], glob($disabledDir . '/*.ct'), 'disabled recording: no container produced');
+
+// ---------------------------------------------------------------------------
+// Genuine prior extension callbacks: execution, chaining, and shutdown restore.
+// The helper is a real compiled PHP extension (see its boundary justification),
+// loaded before CodeTracer. Its own MSHUTDOWN observes restoration after the
+// recorder has shut down. The no-recorder control independently proves that the
+// probe itself observes the pinned interpreter's genuine callback lifecycle.
+function ct_boundary_run(array $command, array $environment): array {
+    $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes, ct_repo_root(), $environment);
+    if (!is_resource($process)) throw new RuntimeException('cannot start boundary probe');
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]); fclose($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    return [proc_close($process), $stdout, $stderr];
+}
+$probeDir = sys_get_temp_dir() . '/ct_php_handler_' . bin2hex(random_bytes(6));
+mkdir($probeDir, 0755, true);
+$probeEnv = $env2;
+[$includesStatus, $includes, $includesError] = ct_boundary_run(['php-config', '--includes'], $probeEnv);
+ct_assert_eq(0, $includesStatus, 'prior handler probe: pinned PHP include discovery');
+$probeLibrary = $probeDir . '/handler_chain_probe.so';
+[$compileStatus, , $compileError] = ct_boundary_run(array_merge(
+    ['cc', '-shared', '-fPIC'], preg_split('/\s+/', trim($includes)),
+    ['tests/handler_chain_probe.c', '-o', $probeLibrary]), $probeEnv);
+ct_assert_eq(0, $compileStatus, 'prior handler probe: real extension compilation');
+if ($compileStatus !== 0) throw new RuntimeException($compileError);
+foreach (['generators' => [7, 0, 1, 1], 'exceptions' => [0, 5, 1, 1]] as $fixture => $expectedReport) {
+    foreach ([false, true] as $withRecorder) {
+        $mode = $withRecorder ? 'with recorder' : 'independent control';
+        $report = $probeDir . '/' . $fixture . ($withRecorder ? '_recorder' : '_control');
+        $probeEnv['CT_HANDLER_PROBE_REPORT'] = $report;
+        $probeEnv['CODETRACER_TRACE_DIR'] = $probeDir . '/traces_' . basename($report);
+        $command = ['php', '-d', 'extension=' . $probeLibrary];
+        if ($withRecorder) array_push($command, '-d', 'extension=' . ct_extension_path());
+        $command[] = $programs_dir . '/' . $fixture . '.php';
+        [$status, $output, $errors] = ct_boundary_run($command, $probeEnv);
+        ct_assert_eq(0, $status, "prior handler $fixture $mode: real PHP exit");
+        ct_assert_eq('', $errors, "prior handler $fixture $mode: no runtime diagnostics");
+        $observedReport = is_file($report)
+            ? array_map('intval', preg_split('/\s+/', trim(file_get_contents($report)))) : [];
+        ct_assert_eq($expectedReport, $observedReport,
+            "prior handler $fixture $mode: exact callback counts and shutdown restoration");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exercise the real projection with deliberately invalid discriminants.
+// This pure-schema negative control mocks no recorder or PHP runtime.
+// "retired" is the pre-EventLogKind spelling the projection once accepted.
+foreach (['unassigned' => ['io_kind' => 'NotAnEventKind'],
+          'missing' => [], 'retired' => ['io_kind' => 'ioStdout']] as $case => $fields) {
+    try {
+        ct_translate_to_legacy(['events' => [array_merge(['kind' => 'io'], $fields)]]);
+        ct_fail("EventLogKind $case discriminant rejected", 'projection accepted invalid schema');
+    } catch (UnexpectedValueException $error) {
+        ct_pass("EventLogKind $case discriminant rejected");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Summary
