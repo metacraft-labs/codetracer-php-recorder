@@ -8,6 +8,8 @@
 #include "SAPI.h"
 #include "php_codetracer.h"
 #include "Zend/zend_signal.h"
+#include "Zend/zend_exceptions.h"
+#include "Zend/zend_generators.h"
 #include "codetracer_trace_writer.h"
 
 #include <stdio.h>
@@ -227,10 +229,13 @@ static void ct_clear_extra_metadata(ct_worker_state *st)
     st->extra_count = 0;
 }
 
-/* Serialize a zval into a trace variable record */
+/* Serialize a zval into a trace variable record.  A reference (a by-ref
+ * parameter, a `global` or `static` binding, a by-ref closure capture) is
+ * recorded as the value it refers to. */
 static void serialize_zval(TraceWriterHandle *writer, const char *name, zval *val)
 {
     if (!val || Z_TYPE_P(val) == IS_UNDEF) return;
+    ZVAL_DEREF(val);
 
     switch (Z_TYPE_P(val)) {
     case IS_NULL:
@@ -297,6 +302,7 @@ static void serialize_return_zval(TraceWriterHandle *writer, zval *val)
         trace_writer_register_return(writer);
         return;
     }
+    ZVAL_DEREF(val);
 
     switch (Z_TYPE_P(val)) {
     case IS_NULL:
@@ -406,7 +412,138 @@ static size_t codetracer_sapi_ub_write(const char *str, size_t str_length)
     return str_length;
 }
 
-/* Our execute_ex hook */
+/* ==========================================================================
+ * Steps, calls and values
+ *
+ * Calls come from the `zend_execute_ex` hook: every user frame the engine
+ * runs is entered through it, and returns out of it.  Steps come from the
+ * compiler's statement markers: with ZEND_COMPILE_EXTENDED_STMT set (see
+ * PHP_RINIT) the compiler emits a ZEND_EXT_STMT opcode before every
+ * statement, and ct_ext_stmt_handler() turns each executed one into a step
+ * at that statement's line.  A frame's entry is a step of its own, at the
+ * `function` line, so a call always owns at least one step even when its
+ * body executes no statement — the shape the Python and Ruby recorders give
+ * a call.
+ *
+ * Every step carries the frame's compiled variables that are defined at
+ * that moment, registered AFTER the step so they attach to it
+ * (`trace-events.md` §"Recorder Integration — Staging Values").  A call's
+ * arguments are compiled variables already bound when the frame is entered,
+ * so they appear on the entry step, once, like any other local.
+ * ========================================================================== */
+
+/* Register every defined compiled variable of the frame on the open step. */
+static void ct_capture_frame_locals(zend_execute_data *execute_data)
+{
+    zend_op_array *op_array = &execute_data->func->op_array;
+    int i;
+    for (i = 0; i < op_array->last_var; i++) {
+        serialize_zval(trace_writer, ZSTR_VAL(op_array->vars[i]),
+                       ZEND_CALL_VAR_NUM(execute_data, i));
+    }
+}
+
+/*
+ * The line a resumed generator continues from.
+ *
+ * A suspended generator's saved opline is the YIELD that suspended it (or
+ * the instruction after it), so its resumption starts at that `yield` — the
+ * statement the program is actually in.  Its first resumption continues
+ * from GENERATOR_CREATE, which carries the function's start line.
+ */
+static uint32_t ct_resume_line(zend_execute_data *execute_data, uint32_t fallback)
+{
+    const zend_op *op = execute_data->opline;
+    const zend_op *first = execute_data->func->op_array.opcodes;
+    if (!op) return fallback;
+    if (op->opcode == ZEND_YIELD || op->opcode == ZEND_YIELD_FROM ||
+        op->opcode == ZEND_GENERATOR_CREATE) {
+        return op->lineno;
+    }
+    if (op > first && ((op - 1)->opcode == ZEND_YIELD ||
+                       (op - 1)->opcode == ZEND_GENERATOR_CREATE)) {
+        return (op - 1)->lineno;
+    }
+    return op->lineno;
+}
+
+/* `exit()` unwinds the stack with an internal object in EG(exception); it is
+ * not an exception the program threw. */
+static int ct_is_exit(zend_object *ex)
+{
+    return zend_is_unwind_exit(ex) || zend_is_graceful_exit(ex);
+}
+
+/* The interned type of an exception: its class, under the same kind an
+ * object value of that class is registered with. */
+static size_t ct_exception_type_id(zend_object *ex)
+{
+    return trace_writer_ensure_type_id(trace_writer, TK_STRUCT,
+                                       ZSTR_VAL(ex->ce->name));
+}
+
+/* The exception's message as an emalloc'd, NUL-terminated copy (its byte
+ * length in *len).  Anything but a string message reads as empty. */
+static char *ct_exception_message(zend_object *ex, size_t *len)
+{
+    zval rv, *msg;
+    char *out;
+    ZVAL_UNDEF(&rv);
+    msg = zend_read_property_ex(zend_get_exception_base(ex), ex,
+                                ZSTR_KNOWN(ZEND_STR_MESSAGE), 1, &rv);
+    if (msg) ZVAL_DEREF(msg);
+    if (msg && Z_TYPE_P(msg) == IS_STRING) {
+        *len = Z_STRLEN_P(msg);
+        out = estrndup(Z_STRVAL_P(msg), Z_STRLEN_P(msg));
+    } else {
+        *len = 0;
+        out = estrdup("");
+    }
+    zval_ptr_dtor(&rv);
+    return out;
+}
+
+/* Close the innermost call as exiting by `ex`: its call record carries the
+ * exception as ValueRecord::Error (message, typed by the exception's class)
+ * and no return value. */
+static void ct_register_exception_exit(zend_object *ex)
+{
+    size_t len, bytes_len = 0;
+    char *msg = ct_exception_message(ex, &len);
+    size_t type_id = ct_exception_type_id(ex);
+    value_encoder_t enc = ct_value_encoder_new();
+    const uint8_t *bytes = NULL;
+
+    if (enc && ct_value_write_error(enc, (const uint8_t *)msg, len, type_id) == 0) {
+        bytes = ct_value_get_bytes(enc, &bytes_len);
+    }
+    if (bytes && bytes_len > 0) {
+        trace_writer_register_return_exception(trace_writer, bytes, bytes_len);
+    } else {
+        /* The call must still close; an exception we could not encode is
+         * reported rather than leaving the frame open. */
+        ct_debug("could not encode the exception exit of %s",
+                 ZSTR_VAL(ex->ce->name));
+        trace_writer_register_return(trace_writer);
+    }
+    if (enc) ct_value_encoder_free(enc);
+    efree(msg);
+}
+
+/*
+ * Our execute_ex hook: one call per stretch of a user frame's execution.
+ *
+ * For an ordinary function that is the whole call.  A generator runs in
+ * stretches, and the call tree records each one as its own call, as the
+ * Python recorder does: the call that creates the generator (PHP binds the
+ * arguments and runs the frame up to GENERATOR_CREATE) returns the Generator
+ * object; every resumption is a new call of the generator function, whose
+ * entry step is where it resumes and which returns the value the generator
+ * yields when it suspends — nothing when it suspends at `yield from`, and on
+ * its last stretch the generator's return value.  A resumption by `send()` also records the sent value, as `<sent>`
+ * on its entry step: it is what the suspended `yield` expression evaluates
+ * to.
+ */
 static void codetracer_execute_ex(zend_execute_data *execute_data)
 {
     if (!tracing_enabled || in_trace_hook || !trace_writer) {
@@ -416,12 +553,20 @@ static void codetracer_execute_ex(zend_execute_data *execute_data)
 
     in_trace_hook = 1;
 
-    /* Extract function info */
     zend_function *func = execute_data->func;
     const char *func_name = NULL;
     const char *file_name = NULL;
     uint32_t line_no = 0;
     int have_info = 0;
+
+    /* Everything the exit path needs is read NOW.  A generator that finishes
+     * frees its frame before returning here, so `execute_data` must not be
+     * read once the original executor has returned. */
+    int is_resumption = (ZEND_CALL_INFO(execute_data) & ZEND_CALL_GENERATOR) != 0;
+    /* A generator frame's return_value slot holds its zend_generator. */
+    zend_generator *generator =
+        is_resumption ? (zend_generator *)execute_data->return_value : NULL;
+    zval *return_slot = is_resumption ? NULL : execute_data->return_value;
 
     if (func) {
         if (func->common.function_name) {
@@ -433,45 +578,24 @@ static void codetracer_execute_ex(zend_execute_data *execute_data)
         }
     }
 
-    /* Register the call and capture arguments.
-     *
-     * IMPORTANT: per the canonical FFI contract (see
-     * trace_writer_register_call doc-comment in
-     * codetracer_trace_writer.h), the args are NOT passed as a
-     * parameter to register_call — they must be staged via
-     * register_variable_* (or, on Nim-backed writers,
-     * register_call_arg) BEFORE register_call so the call record
-     * decoder sees them at function-entry time.  This mirrors the
-     * canonical pattern fixed in the Ruby recorder (handoff entry
-     * 1.22 in /tmp/isonim-migration.txt) and the JS recorder
-     * (handoff entry 1.38).
-     *
-     * The current C FFI (codetracer_trace_writer_ffi) does not
-     * expose register_call_arg, so the args emitted here surface as
-     * scoped variables at the function-entry step rather than on
-     * CallRecord.args directly.  Populating CallRecord.args end-to-
-     * end requires extending the C FFI (see AUDIT-CTFS-2026-05.md).
-     */
     if (func_name && file_name) {
         uintptr_t fid = trace_writer_ensure_function_id(
             trace_writer, func_name, file_name, (int64_t)line_no);
 
-        /* Stage call arguments BEFORE register_call so they appear
-         * in the function-entry frame (canonical CTFS recorder
-         * pattern). */
-        if (func->type == ZEND_USER_FUNCTION) {
-            uint32_t num_args = ZEND_CALL_NUM_ARGS(execute_data);
-            zend_op_array *op_array = &func->op_array;
-
-            for (uint32_t i = 0; i < num_args && i < op_array->num_args; i++) {
-                zval *arg = ZEND_CALL_ARG(execute_data, i + 1);
-                const char *param_name = ZSTR_VAL(op_array->vars[i]);
-                serialize_zval(trace_writer, param_name, arg);
-            }
-        }
-
         trace_writer_register_call(trace_writer, fid);
-        trace_writer_register_step(trace_writer, file_name, (int64_t)line_no);
+        if (is_resumption) {
+            trace_writer_register_step(trace_writer, file_name,
+                (int64_t)ct_resume_line(execute_data, line_no));
+            ct_capture_frame_locals(execute_data);
+            /* send_target is the suspended yield's result slot, set only when
+             * the program uses the yield's value. */
+            if (generator->send_target) {
+                serialize_zval(trace_writer, "<sent>", generator->send_target);
+            }
+        } else {
+            trace_writer_register_step(trace_writer, file_name, (int64_t)line_no);
+            ct_capture_frame_locals(execute_data);
+        }
         have_info = 1;
     }
 
@@ -480,18 +604,124 @@ static void codetracer_execute_ex(zend_execute_data *execute_data)
     /* Call original handler (executes the actual PHP code) */
     original_zend_execute_ex(execute_data);
 
-    /* After return — capture return value and register return */
+    /* After return — close the call by how the frame left. */
     if (tracing_enabled && !in_trace_hook && trace_writer && have_info) {
+        zend_object *ex = EG(exception);
         in_trace_hook = 1;
 
-        if (execute_data->return_value) {
-            serialize_return_zval(trace_writer, execute_data->return_value);
+        if (ex && !ct_is_exit(ex)) {
+            ct_register_exception_exit(ex);
+        } else if (generator && !generator->execute_data) {
+            /* The frame is freed: the generator returned. */
+            serialize_return_zval(trace_writer, &generator->retval);
+        } else if (generator &&
+                   generator->execute_data->opline->opcode == ZEND_YIELD_FROM) {
+            /* Suspended at `yield from`: the stretch handed over to its
+             * delegate and yielded nothing itself.  A delegate generator's
+             * values are its own stretches' returns; an array's are produced
+             * by the engine without running this frame. */
+            trace_writer_register_return(trace_writer);
+        } else if (generator) {
+            /* Suspended at a `yield`: the stretch returns what it yielded. */
+            serialize_return_zval(trace_writer, &generator->value);
+        } else if (return_slot) {
+            serialize_return_zval(trace_writer, return_slot);
         } else {
             trace_writer_register_return(trace_writer);
         }
 
         in_trace_hook = 0;
     }
+}
+
+/* A step per executed statement: ZEND_EXT_STMT precedes each one. */
+static user_opcode_handler_t original_ext_stmt_handler = NULL;
+
+static int ct_ext_stmt_handler(zend_execute_data *execute_data)
+{
+    if (tracing_enabled && !in_trace_hook && trace_writer) {
+        zend_function *func = execute_data->func;
+        const zend_op *opline = execute_data->opline;
+        if (func && ZEND_USER_CODE(func->type) && opline) {
+            in_trace_hook = 1;
+            trace_writer_register_step(trace_writer,
+                ZSTR_VAL(func->op_array.filename), (int64_t)opline->lineno);
+            ct_capture_frame_locals(execute_data);
+            in_trace_hook = 0;
+        }
+    }
+    if (original_ext_stmt_handler) return original_ext_stmt_handler(execute_data);
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+/*
+ * A Catch record when a `catch` clause takes the pending exception.
+ *
+ * Each clause of a try is its own ZEND_CATCH; the engine tries them in
+ * order.  The match test is the engine's own (zend_vm_def.h ZEND_CATCH): the
+ * clause's class, without autoloading, and instanceof.  A clause that does
+ * not match records nothing, and neither does `finally`, which is not a
+ * catch.
+ */
+static user_opcode_handler_t original_catch_handler = NULL;
+
+static int ct_catch_handler(zend_execute_data *execute_data)
+{
+    if (tracing_enabled && !in_trace_hook && trace_writer) {
+        zend_exception_restore();
+        if (EG(exception)) {
+            const zend_op *opline = execute_data->opline;
+            zval *class_name = RT_CONSTANT(opline, opline->op1);
+            zend_class_entry *catch_ce = zend_fetch_class_by_name(
+                Z_STR_P(class_name), Z_STR_P(class_name + 1),
+                ZEND_FETCH_CLASS_NO_AUTOLOAD | ZEND_FETCH_CLASS_SILENT);
+            zend_class_entry *ce = EG(exception)->ce;
+            if (catch_ce && (ce == catch_ce || instanceof_function(ce, catch_ce))) {
+                in_trace_hook = 1;
+                trace_writer_register_catch(trace_writer,
+                                            ct_exception_type_id(EG(exception)));
+                in_trace_hook = 0;
+            }
+        }
+    }
+    if (original_catch_handler) return original_catch_handler(execute_data);
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+/*
+ * Every thrown exception — a `throw`, or one the engine or an internal
+ * function raises — reaches zend_throw_exception_internal(), which calls this
+ * hook with the exception already pending.  It is recorded twice, for two
+ * readers:
+ *
+ *   - an Error I/O event for the event log (recorder-test-requirements §2:
+ *     a raise with a handler produces an EventKindError event).  As in the
+ *     Ruby recorder the content is the message and the metadata is empty;
+ *   - a Raise exec record (`trace-events.md` tag 0x02), typed by the
+ *     exception's class, for the timeline.
+ *
+ * The Error event goes first so it is attributed to the throwing statement's
+ * step rather than to the Raise record.  A re-throw is a throw and is
+ * recorded again; an uncaught exception is recorded here like any other.
+ */
+static void (*original_throw_exception_hook)(zend_object *ex) = NULL;
+
+static void ct_throw_exception_hook(zend_object *ex)
+{
+    if (ex && tracing_enabled && !in_trace_hook && trace_writer && !ct_is_exit(ex)) {
+        size_t len;
+        char *msg;
+        size_t type_id;
+        in_trace_hook = 1;
+        msg = ct_exception_message(ex, &len);
+        type_id = ct_exception_type_id(ex);
+        trace_writer_register_special_event(trace_writer, ELK_ERROR, "", msg);
+        trace_writer_register_raise(trace_writer, type_id,
+                                    (const uint8_t *)msg, len);
+        efree(msg);
+        in_trace_hook = 0;
+    }
+    if (original_throw_exception_hook) original_throw_exception_hook(ex);
 }
 
 /* --------------------------------------------------------------------------
@@ -1305,6 +1535,8 @@ static const zend_function_entry codetracer_functions[] = {
  * Module / request lifecycle
  * -------------------------------------------------------------------------- */
 
+static int ct_hooks_installed = 0;
+
 /* Module initialization */
 PHP_MINIT_FUNCTION(codetracer)
 {
@@ -1332,6 +1564,16 @@ PHP_MINIT_FUNCTION(codetracer)
     }
 
     if (!ct_tracing_requested()) return SUCCESS;
+
+    /* Statement steps, catches and throws.  Installed only when recording,
+     * so a worker that is not recorded runs the engine's own handlers. */
+    original_ext_stmt_handler = zend_get_user_opcode_handler(ZEND_EXT_STMT);
+    zend_set_user_opcode_handler(ZEND_EXT_STMT, ct_ext_stmt_handler);
+    original_catch_handler = zend_get_user_opcode_handler(ZEND_CATCH);
+    zend_set_user_opcode_handler(ZEND_CATCH, ct_catch_handler);
+    original_throw_exception_hook = zend_throw_exception_hook;
+    zend_throw_exception_hook = ct_throw_exception_hook;
+    ct_hooks_installed = 1;
 
     /* See ct_atexit(): PHP-FPM children never reach PHP_MSHUTDOWN. */
     atexit(ct_atexit);
@@ -1369,8 +1611,14 @@ PHP_MSHUTDOWN_FUNCTION(codetracer)
         ct_state = NULL;
     }
 
-    /* Restore original handler */
+    /* Restore original handlers */
     zend_execute_ex = original_zend_execute_ex;
+    if (ct_hooks_installed) {
+        zend_set_user_opcode_handler(ZEND_EXT_STMT, original_ext_stmt_handler);
+        zend_set_user_opcode_handler(ZEND_CATCH, original_catch_handler);
+        zend_throw_exception_hook = original_throw_exception_hook;
+        ct_hooks_installed = 0;
+    }
     return SUCCESS;
 }
 
@@ -1414,6 +1662,11 @@ PHP_RINIT_FUNCTION(codetracer)
 
     ct_state->requests_seen++;
     tracing_enabled = 1;
+
+    /* Have the compiler mark every statement with ZEND_EXT_STMT, which is
+     * where ct_ext_stmt_handler() takes a step.  Set per request, before the
+     * request's scripts are compiled. */
+    CG(compiler_options) |= ZEND_COMPILE_EXTENDED_STMT;
 
     /* trace_writer_start opened the worker's sole <toplevel> frame.
      * Requests are spans within that timeline, not additional roots. Keep

@@ -1,5 +1,4 @@
 .direnv/
-.pre-commit-config.yaml
 ext/.libs/
 ext/.codetracer_trace_writer_nim_orig.h.tmp
 ext/Makefile

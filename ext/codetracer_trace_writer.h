@@ -84,6 +84,16 @@ typedef void TraceWriterHandle;
 #define ELK_ERROR              11
 #define ELK_TRACE_LOG_EVENT    12
 #define ELK_EVM_EVENT          13
+#define ELK_WRITE_STDERR       14
+#define ELK_EXEC               15
+#define ELK_READ_ENV           16
+#define ELK_WRITE_ENV          17
+#define ELK_STAT               18
+#define ELK_CREATE_DIR         19
+#define ELK_REMOVE_DIR         20
+#define ELK_REMOVE_FILE        21
+#define ELK_RENAME             22
+#define ELK_CHANGE_DIR         23
 
 /* --------------------------------------------------------------------------
  * FFI enums (must match Rust codetracer_trace_writer_ffi repr(C) values)
@@ -146,7 +156,17 @@ enum FfiEventLogKind {
     FFI_EVENT_OPEN = 10,
     FFI_EVENT_ERROR = 11,
     FFI_EVENT_TRACE_LOG_EVENT = 12,
-    FFI_EVENT_EVM_EVENT = 13
+    FFI_EVENT_EVM_EVENT = 13,
+    FFI_EVENT_WRITE_STDERR = 14,
+    FFI_EVENT_EXEC = 15,
+    FFI_EVENT_READ_ENV = 16,
+    FFI_EVENT_WRITE_ENV = 17,
+    FFI_EVENT_STAT = 18,
+    FFI_EVENT_CREATE_DIR = 19,
+    FFI_EVENT_REMOVE_DIR = 20,
+    FFI_EVENT_REMOVE_FILE = 21,
+    FFI_EVENT_RENAME = 22,
+    FFI_EVENT_CHANGE_DIR = 23
 };
 
 /* --------------------------------------------------------------------------
@@ -345,6 +365,27 @@ uint8_t* ct_spans_json(const char* path, int settled, size_t* out_len);
 void trace_writer_register_thread_start(trace_writer_t handle, uint64_t thread_id);
 void trace_writer_register_thread_exit(trace_writer_t handle, uint64_t thread_id);
 void trace_writer_register_thread_switch(trace_writer_t handle, uint64_t thread_id);
+
+/* --------------------------------------------------------------------------
+ * Exceptions
+ *
+ * Raise and Catch are step-stream events (`trace-events.md` tags 0x02 and
+ * 0x03); a call that exits by an exception carries it, as CBOR, in its call
+ * record's `exception`. The split-stream writer only: on the legacy writer
+ * each refuses by name through trace_writer_last_error.
+ * -------------------------------------------------------------------------- */
+
+/* An exception of the interned type `exception_type_id` is raised, with
+ * `message_len` bytes of message (`message` may be NULL when it is 0). */
+void trace_writer_register_raise(trace_writer_t handle, uint64_t exception_type_id,
+                                 const uint8_t* message, size_t message_len);
+/* An exception of the interned type `exception_type_id` is caught. */
+void trace_writer_register_catch(trace_writer_t handle, uint64_t exception_type_id);
+/* The innermost call exits by an exception: `exception_len` (> 0) bytes of
+ * CBOR, recorded as its call record's `exception`, with no return value. */
+void trace_writer_register_return_exception(trace_writer_t handle,
+                                            const uint8_t* exception_cbor,
+                                            size_t exception_len);
 
 /* --------------------------------------------------------------------------
  * meta.dat — write via trace writer handle
